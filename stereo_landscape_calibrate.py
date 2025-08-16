@@ -305,7 +305,7 @@ def main():
         cv2.imwrite(str(outdir/"rectified_projective_preview.jpg"), np.hstack([rectL, rectR]))
         print("[+] rectified_projective_preview.jpg готово")
 
-    print(f"[✓] Готово. Вихідна папка: {outdir.resolve()}")
+    print(f"Готово. Вихідна папка: {outdir.resolve()}")
 
 if __name__ == "__main__":
     main()
