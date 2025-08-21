@@ -1,8 +1,8 @@
-# Visual-radar
+# Visual Radar 
 
-This project provides stereo camera calibration and real-time object detection using two RTSP network cameras.
-It includes:
+## Main ideas
+- **Separation of concerns**: калібрування окремо від детекції та стерео-матчингу.
+- **SMDParams**: всі робочі пороги зібрани в одну dataclass-конфігурацію.
+- **Розширюваність**: можна легко замінити motion/stereo на свої реалізації.
 
-stereo_landscape_calibrate.py - captures synchronized image pairs, detects feature points, and generates calibration data (metric or projective mode).
-
-stereo_rtsp_runtime.py - loads the calibration results, rectifies camera streams in real time, detects motion, matches objects between cameras, and (in metric mode) estimates distances.
+Див. `docs/DESIGN.md` для додаткової інформації.

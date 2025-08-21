@@ -1,0 +1,10 @@
+[project]
+name = "visual-radar"
+version = "0.1.0"
+description = "Modular small-target stereo motion detector"
+authors = [{name="You"}]
+requires-python = ">=3.9"
+dependencies = ["opencv-python>=4.7.0", "numpy>=1.22"]
+
+[project.scripts]
+visual-radar = "visual_radar.cli:main"
