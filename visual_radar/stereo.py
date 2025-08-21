@@ -1,4 +1,3 @@
-
 from typing import List, Tuple, Optional
 import numpy as np
 import cv2 as cv
@@ -57,3 +56,15 @@ def epipolar_ncc_match(rectL_gray, rectR_gray, boxL: BBox, search_pad:int, patch
     rx = sx0 + px; ry = sy0 + py
     rb = to_bbox(rx, ry, templ.shape[1], templ.shape[0])
     return rb
+
+def rectified_pair(calib, frameL, frameR):
+    try:
+        rmapL = getattr(calib, "rmapL", None)
+        rmapR = getattr(calib, "rmapR", None)
+        if rmapL is not None and rmapR is not None:
+            rL = cv.remap(frameL, rmapL[0], rmapL[1], interpolation=cv.INTER_LINEAR)
+            rR = cv.remap(frameR, rmapR[0], rmapR[1], interpolation=cv.INTER_LINEAR)
+            return rL, rR
+    except Exception:
+        pass  
+    return frameL, frameR

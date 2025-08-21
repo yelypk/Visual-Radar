@@ -1,4 +1,10 @@
-from .cli import main
+from .cli import build_parser, args_to_config, run
 
-if __name__ == '__main__':
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    cfg = args_to_config(args)
+    run(cfg)
+
+if __name__ == "__main__":
     main()

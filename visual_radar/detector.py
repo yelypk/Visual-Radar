@@ -53,6 +53,19 @@ class StereoMotionDetector:
         self.histL = deque(maxlen=self.persist_k)
         self.histR = deque(maxlen=self.persist_k)
 
+        self.roi = None
+        roi_path = getattr(self.params, 'roi_mask', None)
+        if roi_path:
+            try:
+                m = cv.imread(roi_path, cv.IMREAD_GRAYSCALE)
+                if m is not None:
+                    if m.shape[:2] != (h, w):
+                        m = cv.resize(m, (w, h), interpolation=cv.INTER_NEAREST)
+                    self.roi = (m > 0).astype(np.uint8) * 255
+            except Exception:
+                self.roi = None
+        self.is_night = False
+
     def step(self, rectL_bgr, rectR_bgr):
         gL = as_gray(rectL_bgr)
         gR = as_gray(rectR_bgr)
@@ -60,6 +73,7 @@ class StereoMotionDetector:
         night_auto = bool(getattr(self.params, "night_auto", True))
         night_thr  = float(getattr(self.params, "night_luma_thr", 50.0))
         is_night   = (float(np.mean(gL)) < night_thr) if night_auto else False
+        self.is_night = is_night 
 
         gL = _vr_pre(gL, is_night)
         gR = _vr_pre(gR, is_night)
@@ -82,7 +96,13 @@ class StereoMotionDetector:
             use_clahe=use_clahe,
             size_aware_morph=self.params.size_aware_morph
         )
-
+        crop_top = int(getattr(self.params, 'crop_top', 0))
+        if crop_top > 0:
+         mL[:crop_top, :] = 0
+         mR[:crop_top, :] = 0
+        if self.roi is not None:
+         mL = cv.bitwise_and(mL, self.roi)
+         mR = cv.bitwise_and(mR, self.roi)
         min_area = int(getattr(self.params, "min_area", 25))
         if is_night:
             min_area = int(min_area * float(getattr(self.params, "min_area_night_mult", 4.0)))
