@@ -1,9 +1,26 @@
+import numpy as np
+import cv2 as cv
 
 from typing import Tuple, List, Set
 from .config import SMDParams
 from .motion import as_gray, DualBGModel, find_motion_bboxes
 from .stereo import gate_pairs_rectified, epipolar_ncc_match
 from .utils import BBox
+
+#  Visual Radar night/noise helpers  
+def _vr_sigma(img):
+    # robust sigma via MAD
+    med = np.median(img)
+    mad = np.median(np.abs(img - med))
+    return 1.4826 * mad
+
+def _vr_pre(gray, night: bool):
+    if night:
+        try:
+            return cv.GaussianBlur(gray, (3,3), 0)
+        except Exception:
+            pass
+    return gray
 
 class StereoMotionDetector:
     def __init__(self, frame_size: Tuple[int,int], params: SMDParams):

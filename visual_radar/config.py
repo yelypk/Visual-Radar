@@ -18,6 +18,16 @@ class SMDParams:
     stereo_ncc_min:float = 0.40
     use_clahe: bool = True
     size_aware_morph: bool = True
+    # --- Night & noise-aware ---
+    night_auto: bool = True              # авто-переключение по яркости
+    night_luma_thr: float = 40.0         # порог Y (0..255), ниже = ночь
+    min_area_night_mult: float = 4.0     # во сколько раз увеличить min_area ночью
+    noise_k_fast: float = 3.5            # множитель σ для быстрого диффа
+    noise_k_slow: float = 2.0            # множитель σ для медленного диффа
+    morph_open_day: int = 1              # размер ядра открытия днём
+    morph_open_night: int = 3            # размер ядра открытия ночью
+    crop_top: int = 0                    # срез сверху в пикселях (обрезать небо)
+    roi_mask: Optional[str] = None       # PNG-маска (белое=используем, чёрное=глушим)
 
 @dataclass
 class AppConfig:

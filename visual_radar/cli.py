@@ -54,6 +54,16 @@ def build_parser():
     p.add_argument("--snap_cooldown", type=float, default=1.5)
     p.add_argument("--snap_pad", type=int, default=4)
     p.add_argument("--snap_debug", action="store_true")
+    p.add_argument("--night_auto", action="store_true", default=True, help="Enable auto night mode by average luma")
+    p.add_argument("--night_luma_thr", type=float, default=40.0, help="Avg luma threshold to consider 'night' (0..255)")
+    p.add_argument("--min_area_night_mult", type=float, default=4.0, help="Multiply min_area at night")
+    p.add_argument("--noise_k_fast", type=float, default=3.5, help="k*sigma threshold for fast diff at night/day")
+    p.add_argument("--noise_k_slow", type=float, default=2.0, help="k*sigma threshold for slow diff at night/day")
+    p.add_argument("--morph_open_day", type=int, default=1, help="opening kernel size (day)")
+    p.add_argument("--morph_open_night", type=int, default=3, help="opening kernel size (night)")
+    p.add_argument("--crop_top", type=int, default=0, help="Crop sky (pixels from top)")
+    p.add_argument("--roi_mask", type=str, default=None, help="Optional PNG mask (white=keep, black=ignore)")
+
     return p
 
 def args_to_config(args) -> AppConfig:
@@ -64,8 +74,23 @@ def args_to_config(args) -> AppConfig:
         min_flow=args.min_flow, min_flow_small=args.min_flow_small,
         stereo_patch=args.stereo_patch, stereo_search_pad=args.stereo_search_pad,
         stereo_ncc_min=args.stereo_ncc_min,
-        use_clahe=True, size_aware_morph=True
+        use_clahe=True, size_aware_morph=True,
     )
+
+    extras = dict(
+        night_auto=args.night_auto,
+        night_luma_thr=args.night_luma_thr,
+        min_area_night_mult=args.min_area_night_mult,
+        noise_k_fast=args.noise_k_fast,
+        noise_k_slow=args.noise_k_slow,
+        morph_open_day=args.morph_open_day,
+        morph_open_night=args.morph_open_night,
+        crop_top=args.crop_top,
+        roi_mask=args.roi_mask,
+    )
+    for k, v in extras.items():
+        setattr(smd, k, v)
+
     return AppConfig(
         left=args.left, right=args.right, calib_dir=args.calib_dir,
         intrinsics=args.intrinsics, baseline=args.baseline,
@@ -78,7 +103,7 @@ def args_to_config(args) -> AppConfig:
         display_max_w=args.display_max_w, display_max_h=args.display_max_h,
         snapshots=args.snapshots, snap_dir=args.snap_dir, snap_min_disp=args.snap_min_disp,
         snap_min_cc=args.snap_min_cc, snap_min_z=args.snap_min_z, snap_max_z=args.snap_max_z,
-        snap_cooldown=args.snap_cooldown, snap_pad=args.snap_pad, snap_debug=args.snap_debug
+        snap_cooldown=args.snap_cooldown, snap_pad=args.snap_pad, snap_debug=args.snap_debug,
     )
 
 def warmup(reader, name, timeout_s=8.0):
