@@ -63,7 +63,8 @@ def build_parser():
     p.add_argument("--morph_open_night", type=int, default=3, help="opening kernel size (night)")
     p.add_argument("--crop_top", type=int, default=0, help="Crop sky (pixels from top)")
     p.add_argument("--roi_mask", type=str, default=None, help="Optional PNG mask (white=keep, black=ignore)")
-
+    p.add_argument("--persist_k", type=int, default=4, help="Temporal window size for mask persistence")
+    p.add_argument("--persist_m", type=int, default=3, help="Min frames in window to keep a pixel")
     return p
 
 def args_to_config(args) -> AppConfig:
@@ -87,6 +88,8 @@ def args_to_config(args) -> AppConfig:
         morph_open_night=args.morph_open_night,
         crop_top=args.crop_top,
         roi_mask=args.roi_mask,
+        persist_k=args.persist_k,
+        persist_m=args.persist_m,
     )
     for k, v in extras.items():
         setattr(smd, k, v)
