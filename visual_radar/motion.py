@@ -1,10 +1,10 @@
+
 from typing import Tuple, List, Optional
 import numpy as np
 import cv2 as cv
 from .utils import BBox, to_bbox, clamp
 
 def as_gray(img):
-    import cv2 as cv
     if img.ndim == 2:
         return img
     return cv.cvtColor(img, cv.COLOR_BGR2GRAY)
@@ -75,3 +75,33 @@ def find_motion_bboxes(gray, bg: DualBGModel,
         if max_area > 0 and area > max_area: continue
         boxes.append(to_bbox(x,y,w,h))
     return fg, boxes
+
+def make_masks_static_and_slow(gray, bg: DualBGModel,
+                               thr_fast: float, thr_slow: float,
+                               use_clahe=True, kernel_size=3):
+    """
+    Returns (mask_static_removed, mask_slow_dynamic_removed).
+    - mask_static_removed: foreground by fast difference (removes static background)
+    - mask_slow_dynamic_removed: fast - slow, zero where slow > thr_slow (removes slow clouds)
+    """
+    if use_clahe:
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        g = clahe.apply(gray)
+    else:
+        g = gray
+
+    df, ds = bg.update(g)
+    fast = cv.convertScaleAbs(df); slow = cv.convertScaleAbs(ds)
+
+    _, m_static = cv.threshold(fast, thr_fast, 255, cv.THRESH_BINARY)
+
+    resp = cv.subtract(fast, slow)
+    _, m_slow = cv.threshold(resp, thr_fast, 255, cv.THRESH_BINARY)
+    m_slow[slow > thr_slow] = 0
+
+    K = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    m_static = cv.morphologyEx(m_static, cv.MORPH_OPEN, K, iterations=1)
+    m_slow   = cv.morphologyEx(m_slow,   cv.MORPH_OPEN, K, iterations=1)
+    m_static = cv.dilate(m_static, K, iterations=1)
+    m_slow   = cv.dilate(m_slow,   K, iterations=1)
+    return m_static, m_slow

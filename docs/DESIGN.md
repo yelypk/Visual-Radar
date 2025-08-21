@@ -1,18 +1,21 @@
 # DESIGN
 
 ## Потік даних
-1. **IO** (`io.RTSPReader`) - кадри та таймштампи.
-2. **SYNC** (`sync.best_time_aligned`) - вибирає L/R пари, близькі за часом.
-3. **CALIBRATION** (`calibration.load_calibration`, `rectified_pair`) - ректифікація.
-4. **DETECTOR** (`detector.StereoMotionDetector`) 
-   - **MOTION** (`motion.DualBGModel`, `find_motion_bboxes`) - маска руху + бокси L/R.
-   - **STEREO** (`stereo.gate_pairs_rectified`, `epipolar_ncc_match`) - паринг боксів.
-5. **VISUALIZE** (`visualize.draw_boxes`, `stack_lr`) - відображення\малювання
-6. **IO** (writer) - опціональний запис mp4.
+1. **IO** (`open_stream`) → RTSP через OpenCV або FFmpeg→MJPEG, кадри+таймштампи.
+2. **SYNC** (`best_time_aligned`) → підбір L/R пар близьких за часом.
+3. **CALIBRATION** (`load_calibration`, `rectified_pair`) → ректифікація.
+4. **DETECTOR** (`StereoMotionDetector`) →
+   - **MOTION** (`DualBGModel`, `find_motion_bboxes`) → маска руху + бокси L/R.
+   - **STEREO** (`gate_pairs_rectified`, `epipolar_ncc_match`) → паринг боксов.
+5. **VISUALIZE** (`draw_boxes`, `resize_for_display`) → відображення.
+6. **SNAPSHOTS** (`SnapshotSaver`) → збереження пар L/R з метаданими.
+7. **IO(writer)** → опціональна запис в mp4.
 
-## Конфігурування
-Усі парметри зібрани до `config.SMDParams` та `config.AppConfig`. CLI парсит аргументи та збирає конфіги.
+## Конфіг
+- `AppConfig` містить параметри стріму, відображення, знімків та SMD.
+- Рідер: `opencv` або `ffmpeg_mjpeg` (транскодинг у MJPEG через ffmpeg).
 
-## Тестування
-- Unit-тести для `motion.compute_mad`, `stereo.gate_pairs_rectified` та `epipolar_ncc_match`.
-- Інтеграційні: мокові кадри L/R із синтетичними зсувами.
+## Маски фону
+- `make_masks_static_and_slow` повертає дві маски:
+  - статичний фон вирізаний (швидка різниця),
+  - повільно-динамічний фон вирізаний (fast - slow, глушимо зони з великим slow).

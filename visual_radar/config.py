@@ -1,5 +1,6 @@
-from dataclasses import dataclass
-from typing import Optional, Tuple
+
+from dataclasses import dataclass, field
+from typing import Optional
 
 @dataclass
 class SMDParams:
@@ -31,4 +32,25 @@ class AppConfig:
     display: bool = False
     headless: bool = False
     save_vis: Optional[str] = None
-    smd: SMDParams = SMDParams()
+    smd: SMDParams = field(default_factory=SMDParams)
+
+    # Stream / transcoding
+    reader: str = "opencv"            # "opencv" | "ffmpeg_mjpeg"
+    ffmpeg: str = "ffmpeg"
+    mjpeg_q: int = 6
+    ff_threads: int = 3
+
+    # Display
+    display_max_w: int = 1280
+    display_max_h: int = 720
+
+    # Snapshots
+    snapshots: bool = True
+    snap_dir: str = "detections"
+    snap_min_disp: float = 1.5
+    snap_min_cc: float = 0.60
+    snap_min_z: float = 0.0
+    snap_max_z: float = 5000.0
+    snap_cooldown: float = 1.5
+    snap_pad: int = 4
+    snap_debug: bool = False

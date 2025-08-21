@@ -1,5 +1,5 @@
+
 from typing import Tuple, List, Set
-import numpy as np
 from .config import SMDParams
 from .motion import as_gray, DualBGModel, find_motion_bboxes
 from .stereo import gate_pairs_rectified, epipolar_ncc_match

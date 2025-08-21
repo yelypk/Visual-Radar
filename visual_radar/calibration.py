@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from pathlib import Path
@@ -43,8 +44,7 @@ def load_calibration(calib_dir: Path,
             R = np.eye(3, dtype=np.float64)
         if T is None and baseline_m is not None:
             T = np.array([[-baseline_m, 0, 0]], dtype=np.float64).T
-        assert K1 is not None and K2 is not None and D1 is not None and D2 is not None and T is not None, \
-            "intrinsics.npz must contain K1,K2,D1,D2 and either T or provide --baseline"
+        assert K1 is not None and K2 is not None and D1 is not None and D2 is not None and T is not None,             "intrinsics.npz must contain K1,K2,D1,D2 and either T or provide --baseline"
 
         size = (w,h)
         R1,R2,P1,P2,Q,roi1,roi2 = cv.stereoRectify(K1,K2,D1,D2,size,R,T, flags=cv.CALIB_ZERO_DISPARITY, alpha=0)

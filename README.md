@@ -1,8 +1,4 @@
 # Visual Radar 
 
-## Main ideas
-- **Separation of concerns**: калібрування окремо від детекції та стерео-матчингу.
-- **SMDParams**: всі робочі пороги зібрани в одну dataclass-конфігурацію.
-- **Розширюваність**: можна легко замінити motion/stereo на свої реалізації.
-
-Див. `docs/DESIGN.md` для додаткової інформації.
+- `--display_max_w/--display_max_h` — зменшення картинки перед показом.
+- `--snapshots --snap_dir detections` — збереження скріншотів знайдених об'єктів.
