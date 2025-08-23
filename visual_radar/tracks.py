@@ -14,12 +14,9 @@ def _iou_xywh(a: Tuple[float, float, float, float],
     bx, by, bw, bh = b
     ax2, ay2 = ax + aw, ay + ah
     bx2, by2 = bx + bw, by + bh
-    ix1 = max(ax, bx)
-    iy1 = max(ay, by)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
+    ix1 = max(ax, bx); iy1 = max(ay, by)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
     inter = iw * ih
     if inter <= 0.0:
         return 0.0
@@ -46,10 +43,7 @@ class Trk:
     move_hist: List[float] = field(default_factory=list)
 
     def push(self, cx: float, cy: float, win: int = 8) -> None:
-        if self.last_cx is None:
-            move = 0.0
-        else:
-            move = hypot(cx - self.last_cx, cy - self.last_cy)
+        move = 0.0 if self.last_cx is None else hypot(cx - self.last_cx, cy - self.last_cy)
         self.move_hist.append(move)
         if len(self.move_hist) > win:
             self.move_hist.pop(0)
@@ -86,8 +80,7 @@ class BoxTracker:
 
     def _match(self, det_xywh: List[Tuple[float, float, float, float]]) -> List[Tuple[int, int]]:
         """Грубое сопоставление по максимальному IoU (жадно)."""
-        M = len(self.tracks)
-        N = len(det_xywh)
+        M = len(self.tracks); N = len(det_xywh)
         if M == 0 or N == 0:
             return []
 
@@ -109,8 +102,7 @@ class BoxTracker:
                 iou[ti, di] = -1.0
                 continue
             matches.append((ti, di))
-            used_t.add(ti)
-            used_d.add(di)
+            used_t.add(ti); used_d.add(di)
             # блокируем строку/столбец
             iou[ti, :] = -1.0
             iou[:, di] = -1.0
@@ -122,19 +114,14 @@ class BoxTracker:
         Возвращает множество ИНДЕКСОВ детекций (из входного списка),
         которые прошли критерии показа.
         """
-        # детекции в удобном виде
         det_xywh = [(float(b.x), float(b.y), float(b.w), float(b.h)) for b in boxes]
         det_cent = [(float(b.cx), float(b.cy)) for b in boxes]
         N = len(boxes)
 
         # 1) сопоставляем текущие треки и детекции
         matches = self._match(det_xywh)
-
-        matched_d: Set[int] = set()
-        matched_t: Set[int] = set()
-        for ti, di in matches:
-            matched_t.add(ti)
-            matched_d.add(di)
+        matched_d: Set[int] = {di for _, di in matches}
+        matched_t: Set[int] = {ti for ti, _ in matches}
 
         # 2) обновляем совпавшие треки
         for ti, di in matches:
@@ -154,11 +141,11 @@ class BoxTracker:
             x, y, w, h = det_xywh[di]
             cx, cy = det_cent[di]
             t = Trk(x=x, y=y, w=w, h=h, cx=cx, cy=cy, id=self.next_id, age=1, misses=0)
-            t.push(cx, cy)  # инициализируем историю движения
+            t.push(cx, cy)
             self.tracks.append(t)
             self.next_id += 1
 
-        # 4) увеличиваем счётчик пропусков у неподтверждённых треков
+        # 4) увеличиваем счётчик пропусков; удаляем «просроченные»
         keep_tracks: List[Trk] = []
         for ti, t in enumerate(self.tracks):
             if ti in matched_t:
@@ -171,15 +158,11 @@ class BoxTracker:
 
         # 5) критерии показа — возвращаем индексы детекций, которые стоит рисовать
         to_show: Set[int] = set()
-        # сопоставление id детекции -> трек (после апдейта)
         det_to_trk: dict[int, Trk] = {}
-        # пересчитаем индекс трека в self.tracks после фильтрации
-        # пробегаем по актуальным трекам и ищем, какой детекции они соответствуют в этом кадре
-        # (используем ближайшую по IoU, чтобы восстановить связь)
+
         if len(self.tracks) and N:
-            # пересоберём быструю карту на текущем кадре
+            # пересобираем «быструю» связь детекция→трек по лучшему IoU
             for ti, t in enumerate(self.tracks):
-                # ищем лучшую детекцию для этого трека
                 best_iou, best_di = 0.0, -1
                 tb = (t.x, t.y, t.w, t.h)
                 for di, db in enumerate(det_xywh):
@@ -191,13 +174,10 @@ class BoxTracker:
 
         for di in range(N):
             t = det_to_trk.get(di)
-            if not t:
-                continue
-            if t.misses > 0:
-                continue
-            if t.age < self.min_age:
+            if not t or t.misses > 0 or t.age < self.min_age:
                 continue
             if (t.total_move() >= self.min_disp) or (t.avg_speed() >= self.min_speed):
                 to_show.add(di)
 
         return to_show
+

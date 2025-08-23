@@ -63,7 +63,6 @@ class FFmpegRTSP_MJPEG:
 
         scale = []
         if self.w and self.h:
-            # фиксируем размер на выходе; если не задан — оставляем нативный
             scale = ["-vf", f"scale={self.w}:{self.h}:flags=bicubic"]
 
         cmd = [
@@ -172,9 +171,10 @@ class FFmpegRTSP_MJPEG:
 class RTSPReader:
     """
     OpenCV VideoCapture с FFMPEG backend.
-    - Принудительно включает RTSP/TCP через OPENCV_FFMPEG_CAPTURE_OPTIONS
-    - Для сетевых потоков уменьшает буфер (CAP_PROP_BUFFERSIZE=1)
-    - Не меняет размер по CAP_PROP_FRAME_* для RTSP (смещение/«полосы»)
+    - RTSP/TCP через OPENCV_FFMPEG_CAPTURE_OPTIONS
+    - CAP_PROP_BUFFERSIZE для сетевых потоков
+    - CAP_PROP_CONVERT_RGB=1
+    - Для RTSP не меняем CAP_PROP_FRAME_* (смещения/«полосы»)
     """
     def _set_default_ffmpeg_opts(self):
         env = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
@@ -183,7 +183,7 @@ class RTSPReader:
                 "rtsp_transport;tcp|stimeout;3000000|max_delay;500000|buffer_size;1048576"
             )
 
-    def __init__(self, url: str, width: Optional[int], height: Optional[int]):
+    def __init__(self, url: str, width: Optional[int], height: Optional[int], cap_buffersize: Optional[int] = None):
         try:
             self._set_default_ffmpeg_opts()
         except Exception:
@@ -191,12 +191,20 @@ class RTSPReader:
         self.cap = cv.VideoCapture(url, cv.CAP_FFMPEG)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open stream: {url}")
+
         # уменьшить внутренний буфер, если это RTSP
+        if _is_rtsp(url):
+            try:
+                self.cap.set(cv.CAP_PROP_BUFFERSIZE, int(cap_buffersize if cap_buffersize is not None else 1))
+            except Exception:
+                pass
+
+        # гарантируем BGR uint8 (см. docs: CAP_PROP_CONVERT_RGB)
         try:
-            if _is_rtsp(url):
-                self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv.CAP_PROP_CONVERT_RGB, 1)
         except Exception:
             pass
+
         # Размер не трогаем для RTSP. Для локальных файлов/USB-камер можно.
         if width and height and not _is_rtsp(url):
             self.cap.set(cv.CAP_PROP_FRAME_WIDTH, int(width))
@@ -209,7 +217,6 @@ class RTSPReader:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return False, None, None
-        # гарантируем uint8 BGR
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8, copy=False)
         return True, frame, now_s()
@@ -229,13 +236,14 @@ def open_stream(
     ffmpeg: str = "ffmpeg",
     mjpeg_q: int = 6,
     ff_threads: int = 3,
+    cap_buffersize: int | None = None,
 ):
     if reader == "ffmpeg_mjpeg":
         return FFmpegRTSP_MJPEG(
             url, width, height,
             ffmpeg_cmd=ffmpeg, q=mjpeg_q, threads=ff_threads
         )
-    return RTSPReader(url, width, height)
+    return RTSPReader(url, width, height, cap_buffersize=cap_buffersize)
 
 
 def make_writer(path: str, frame_size: Tuple[int, int], fps: float = 20.0):

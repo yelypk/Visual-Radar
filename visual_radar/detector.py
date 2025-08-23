@@ -1,4 +1,3 @@
-# visual_radar/detector.py
 from __future__ import annotations
 
 from collections import deque
@@ -19,13 +18,14 @@ from visual_radar.utils import BBox
 
 
 def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
-    """Немного шумоподавления ночью."""
+    """Лёгкое шумоподавление ночью (поддерживаем чётные/нечётные ядра согласно докам)."""
     if night:
+        # non-local means затем мягкий Gaussian
         try:
             gray = cv.fastNlMeansDenoising(gray, None, 7, 7, 21)
-            gray = cv.GaussianBlur(gray, (5, 5), 0)
         except Exception:
-            gray = cv.GaussianBlur(gray, (5, 5), 0)
+            pass
+        gray = cv.GaussianBlur(gray, (5, 5), 0)
     return gray
 
 
@@ -54,9 +54,7 @@ def _shape_gate_sky(
     max_sky_w: int = 240,
     min_h: int = 3,
 ) -> List[BBox]:
-    """
-    Фильтр «формы» только для НЕБА: отбрасываем длинные горизонтальные ленты облаков.
-    """
+    """Фильтр «формы» только для НЕБА: отбрасываем длинные горизонтальные ленты облаков."""
     out: List[BBox] = []
     thr_y = split * float(h)
     for b in boxes:
@@ -169,12 +167,11 @@ class StereoMotionDetector:
 
         use_clahe = bool(getattr(self.params, "use_clahe", True))
         if self.is_night:
-            use_clahe = False
+            use_clahe = False  # ночью лучше без CLAHE → меньше фантомов
 
         # базовые маски движения
         mL, _ = find_motion_bboxes(
-            gL,
-            self.bgL,
+            gL, self.bgL,
             int(getattr(self.params, "min_area", 25)),
             int(getattr(self.params, "max_area", 0)),
             float(getattr(self.params, "thr_fast", 2.0)),
@@ -183,8 +180,7 @@ class StereoMotionDetector:
             size_aware_morph=bool(getattr(self.params, "size_aware_morph", True)),
         )
         mR, _ = find_motion_bboxes(
-            gR,
-            self.bgR,
+            gR, self.bgR,
             int(getattr(self.params, "min_area", 25)),
             int(getattr(self.params, "max_area", 0)),
             float(getattr(self.params, "thr_fast", 2.0)),
@@ -196,26 +192,21 @@ class StereoMotionDetector:
         # подавляем «медленный» дрейф облаков В НЕБЕ
         try:
             mL_static, mL_slow = make_masks_static_and_slow(
-                gL,
-                self.bgL,
+                gL, self.bgL,
                 float(getattr(self.params, "thr_fast", 2.0)),
                 float(getattr(self.params, "thr_slow", 1.0)),
-                use_clahe=use_clahe,
-                kernel_size=3,
+                use_clahe=use_clahe, kernel_size=3,
             )
             mR_static, mR_slow = make_masks_static_and_slow(
-                gR,
-                self.bgR,
+                gR, self.bgR,
                 float(getattr(self.params, "thr_fast", 2.0)),
                 float(getattr(self.params, "thr_slow", 1.0)),
-                use_clahe=use_clahe,
-                kernel_size=3,
+                use_clahe=use_clahe, kernel_size=3,
             )
             h2, _ = gL.shape[:2]
             split = float(getattr(self.params, "y_area_split", 0.55))
             sky_y = int(split * h2)
-            sky_mask = np.zeros_like(mL, dtype=np.uint8)
-            sky_mask[:sky_y, :] = 255
+            sky_mask = np.zeros_like(mL, dtype=np.uint8); sky_mask[:sky_y, :] = 255
             not_sky = cv.bitwise_not(sky_mask)
 
             mL = cv.bitwise_or(cv.bitwise_and(mL, not_sky), cv.bitwise_and(mL_slow, sky_mask))
@@ -229,7 +220,7 @@ class StereoMotionDetector:
             mL[:crop_top, :] = 0
             mR[:crop_top, :] = 0
 
-        # --- ЕДИНСТВЕННЫЙ ROI-БЛОК: бинаризация + автоподгон под текущий размер масок ---
+        # --- ROI: один блок, бинаризация + автоподгон под текущий размер масок ---
         if self.roi is not None:
             if self.roi.ndim == 3:
                 self.roi = cv.cvtColor(self.roi, cv.COLOR_BGR2GRAY)
@@ -240,7 +231,7 @@ class StereoMotionDetector:
                 self.roi = (self.roi > 0).astype(np.uint8) * 255
             mL = cv.bitwise_and(mL, self.roi)
             mR = cv.bitwise_and(mR, self.roi)
-        # -------------------------------------------------------------------------------
+        # --------------------------------------------------------------------------
 
         # ночная коррекция min_area
         min_area = int(getattr(self.params, "min_area", 25))
@@ -313,23 +304,12 @@ class StereoMotionDetector:
             max_w = int(getattr(self.params, "sails_max_w", 240))
             min_h = int(getattr(self.params, "sails_min_h", 6))
 
-            boxesL = _sails_only_gate(
-                boxesL, gL, water_y,
-                white_delta=white_delta,
-                min_h_over_w=min_h_over_w,
-                max_w=max_w, min_h=min_h,
-            )
-            boxesR = _sails_only_gate(
-                boxesR, gR, water_y,
-                white_delta=white_delta,
-                min_h_over_w=min_h_over_w,
-                max_w=max_w, min_h=min_h,
-            )
+            boxesL = _sails_only_gate(boxesL, gL, water_y, white_delta, min_h_over_w, max_w, min_h)
+            boxesR = _sails_only_gate(boxesR, gR, water_y, white_delta, min_h_over_w, max_w, min_h)
 
         # спаривание L/R и досведение NCC
         pairs = gate_pairs_rectified(
-            boxesL,
-            boxesR,
+            boxesL, boxesR,
             float(getattr(self.params, "y_eps", 6.0)),
             float(getattr(self.params, "dmin", -512.0)),
             float(getattr(self.params, "dmax", 512.0)),
@@ -340,9 +320,7 @@ class StereoMotionDetector:
             if any(i == ii for ii, _ in pairs):
                 continue
             rb = epipolar_ncc_match(
-                gL,
-                gR,
-                bl,
+                gL, gR, bl,
                 int(getattr(self.params, "stereo_search_pad", 64)),
                 int(getattr(self.params, "stereo_patch", 13)),
                 float(getattr(self.params, "stereo_ncc_min", 0.25)),

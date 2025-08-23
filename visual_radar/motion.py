@@ -1,4 +1,3 @@
-# visual_radar/motion.py
 from __future__ import annotations
 
 from typing import List, Tuple
@@ -12,7 +11,7 @@ from visual_radar.utils import BBox
 # helpers
 # -----------------------------
 def as_gray(img) -> np.ndarray:
-    """RGB/BGR -> GRAY uint8."""
+    """RGB/BGR -> GRAY uint8 (строго uint8, как требует большинство OpenCV-алгоритмов)."""
     if img is None:
         raise ValueError("as_gray: None image")
     if len(img.shape) == 2:
@@ -76,11 +75,11 @@ class DualBGModel:
     Две фоновые модели:
       - fast: короткая память → выделяет быстрое движение (паруса, птицы, волны)
       - slow: длинная память → улавливает медленный дрейф (облака/общая яркость)
-    Реализация на MOG2, т.к. он стабильно работает на Win/FFmpeg.
+    Реализация на MOG2, т.к. он стабилен на Win/FFmpeg.
     """
     def __init__(self, shape_hw: Tuple[int, int]):
         h, w = int(shape_hw[0]), int(shape_hw[1])
-        # Параметры подобраны практично; при желании можно прокинуть в SMDParams
+        # Параметры подобраны практично; по докам — history/varThreshold гибкие
         self.fast = cv.createBackgroundSubtractorMOG2(history=50, varThreshold=16, detectShadows=False)
         self.slow = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=12, detectShadows=False)
 
@@ -108,24 +107,21 @@ def find_motion_bboxes(
 ) -> Tuple[np.ndarray, List[BBox]]:
     """
     Главная функция: получить маску движения и список боксов.
-    - Делаем (опционально) CLAHE для устойчивости к неравномерной экспозиции.
-    - Получаем две маски от "быстрой" и "медленной" модели.
-    - Усиливаем, чистим морфологией, фильтруем по площади.
-    Возвращает (mask, boxes). В большинстве мест дальше используется только mask.
+    - Опционально CLAHE (устойчивость к неравномерной экспозиции).
+    - Две маски от "быстрой" и "медленной" модели.
+    - Усиление, чистка морфологией, фильтрация по площади.
     """
     g = gray
     if use_clahe:
-        # CLAHE помогает на воде с бликами и ползущим градиентом в небе
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(g)
 
     mf = bg.apply_fast(g)
     ms = bg.apply_slow(g)
 
-    # Пороговые коэффициенты можно использовать как "вес" вкладов масок:
+    # Пороговые коэффициенты — как "веса" вкладов масок:
     alpha = float(max(0.0, thr_fast))
     beta = float(max(0.0, thr_slow))
-    # нормализуем веса в [0..1], чтобы не взрывать значения
     denom = max(1e-6, alpha + beta)
     alpha /= denom
     beta /= denom
@@ -149,9 +145,8 @@ def make_masks_static_and_slow(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Вернуть две маски:
-      - static: консервативная (почти-статичный фон) — может использоваться для подавления шума
+      - static: консервативная (почти-статичный фон)
       - slow: медленный дрейф (облака и т.п.), чтобы "смягчить" верхнюю часть кадра
-    На практике в проекте используется в небе: заменяем там fast-маску на медленную.
     """
     g = gray
     if use_clahe:
@@ -161,8 +156,6 @@ def make_masks_static_and_slow(
     mf = bg.apply_fast(g)
     ms = bg.apply_slow(g)
 
-    # "static" — всё, что НЕ отмечено как быстро меняющееся (инверт fast),
-    # но оставим только те области, где slow тоже спокоен → уменьшаем фантомы.
     k = max(3, int(kernel_size) | 1)
     ker = cv.getStructuringElement(cv.MORPH_ELLIPSE, (k, k))
 
@@ -174,4 +167,5 @@ def make_masks_static_and_slow(
 
     slow = cv.morphologyEx(slow_bin, cv.MORPH_OPEN, ker, iterations=1)
     return static, slow
+
 

@@ -39,6 +39,7 @@ def build_parser():
     p.add_argument("--display", action="store_true")
     p.add_argument("--display_max_w", type=int, default=1920)
     p.add_argument("--display_max_h", type=int, default=1080)
+    p.add_argument("--window", choices=["normal", "autosize"], default="normal")
     p.add_argument("--save_vis", action="store_true")
     p.add_argument("--save_path", type=str, default="out.mp4")
     p.add_argument("--save_fps", type=float, default=15.0)
@@ -93,6 +94,14 @@ def build_parser():
     # синхронизация
     p.add_argument("--sync_max_dt", type=float, default=0.05)
 
+    # системные/бэкенд опции OpenCV
+    p.add_argument("--cap_buffersize", type=int, default=1, help="CAP_PROP_BUFFERSIZE для сетевых потоков")
+    p.add_argument("--cv_threads", type=int, default=0, help="0=по умолчанию OpenCV; >0 — setNumThreads(N)")
+    p.add_argument("--no_optimized", action="store_true", help="отключить setUseOptimized(True)")
+
+    # отладка
+    p.add_argument("--print_fps", action="store_true", help="печать FPS главного цикла")
+
     return p
 
 
@@ -131,11 +140,16 @@ def args_to_config(args) -> AppConfig:
         smd=smd,
         reader=args.reader, ffmpeg=args.ffmpeg, mjpeg_q=int(args.mjpeg_q), ff_threads=int(args.ff_threads),
         display_max_w=int(args.display_max_w), display_max_h=int(args.display_max_h),
+        window=args.window,
         snapshots=bool(args.snapshots), snap_dir=args.snap_dir,
         snap_min_cc=float(args.snap_min_cc), snap_min_disp=float(args.snap_min_disp),
         snap_pad=int(args.snap_pad), snap_cooldown=float(args.snap_cooldown), snap_debug=bool(args.snap_debug),
         save_path=args.save_path, save_fps=float(args.save_fps),
         sync_max_dt=float(args.sync_max_dt),
+        cap_buffersize=int(args.cap_buffersize),
+        cv_threads=int(args.cv_threads),
+        use_optimized=not bool(args.no_optimized),
+        print_fps=bool(args.print_fps),
     )
 
 
@@ -150,10 +164,19 @@ def warmup(reader, name: str, timeout_s: float = 20.0):
 
 
 def run(cfg: AppConfig):
-    L = open_stream(cfg.left, cfg.width, cfg.height, reader=cfg.reader, ffmpeg=cfg.ffmpeg,
-                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
-    R = open_stream(cfg.right, cfg.width, cfg.height, reader=cfg.reader, ffmpeg=cfg.ffmpeg,
-                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
+    # глобальные настройки OpenCV (docs: setNumThreads / setUseOptimized)
+    if cfg.cv_threads and cfg.cv_threads > 0:
+        cv.setNumThreads(int(cfg.cv_threads))
+    cv.setUseOptimized(bool(cfg.use_optimized))
+
+    L = open_stream(cfg.left, cfg.width, cfg.height,
+                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
+                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
+                    cap_buffersize=cfg.cap_buffersize)
+    R = open_stream(cfg.right, cfg.width, cfg.height,
+                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
+                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
+                    cap_buffersize=cfg.cap_buffersize)
 
     okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
     okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
@@ -163,9 +186,9 @@ def run(cfg: AppConfig):
         try: L.release(); R.release()
         except Exception: pass
         L = open_stream(cfg.left, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
-                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
+                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads, cap_buffersize=cfg.cap_buffersize)
         R = open_stream(cfg.right, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
-                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
+                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads, cap_buffersize=cfg.cap_buffersize)
         okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
         okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
 
@@ -175,16 +198,17 @@ def run(cfg: AppConfig):
         except Exception: pass
         return
 
-    # --- Синхронизируем cfg.width/height с реальными из кадра (док. OpenCV: не полагаться на set/get для сетевых источников)
+    # синхронизируем размеры с реальными (docs: не полагаться на set/get для сетевых источников)
     h0, w0 = fL0.shape[:2]
     if (cfg.width, cfg.height) != (w0, h0):
         cfg.width, cfg.height = w0, h0
 
-    # подготовка окна (если показываем)
+    # окно
     if cfg.display:
-        cv.namedWindow("VisualRadar L|R", cv.WINDOW_NORMAL)
+        flag = cv.WINDOW_NORMAL if cfg.window == "normal" else cv.WINDOW_AUTOSIZE
+        cv.namedWindow("VisualRadar L|R", flag)
 
-    # калибровка/ремап под фактический размер
+    # калибровка/ремап
     calib = load_calibration(
         Path(cfg.calib_dir),
         Path(cfg.intrinsics) if cfg.intrinsics else None,
@@ -224,6 +248,10 @@ def run(cfg: AppConfig):
     writer = None
     sp = Path(cfg.save_path) if cfg.save_vis else None
 
+    # FPS печать
+    t_fps = time.perf_counter()
+    fps_cnt = 0
+
     print("[*] Running.  Press ESC to stop.")
     try:
         while True:
@@ -232,12 +260,11 @@ def run(cfg: AppConfig):
             if not okL or not okR:
                 continue
 
-            # гейт по рассинхрону меток времени
+            # гейт по рассинхрону
             if abs(float(tL) - float(tR)) > float(cfg.sync_max_dt):
                 continue
 
             rL, rR = rectified_pair(calib, fL, fR)
-
             mL, mR, boxesL, boxesR, pairs = det.step(rL, rR)
 
             # стерео-фильтр по минимальному диспаритету
@@ -299,6 +326,13 @@ def run(cfg: AppConfig):
                         (int(br.x), int(br.y), int(br.w), int(br.h)),
                         disp, Q=Q,
                     )
+
+            # FPS
+            fps_cnt += 1
+            if cfg.print_fps and (time.perf_counter() - t_fps) >= 1.0:
+                print(f"[loop] {fps_cnt} FPS")
+                fps_cnt = 0
+                t_fps = time.perf_counter()
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user.")

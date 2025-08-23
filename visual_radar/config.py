@@ -56,7 +56,7 @@ class SMDParams:
     y_area_boost: float = 1.6
     y_area_split: float = 0.55
 
-    # --- контраст/усиление ---
+    # --- контраст ---
     use_clahe: bool = True
 
     # --- SAILS ONLY ---
@@ -77,11 +77,11 @@ class AppConfig:
     intrinsics: Optional[str] = None
     baseline: Optional[float] = None
 
-    # Эти размеры будут синхронизированы с фактическими после первого кадра
+    # Эти размеры синхронизируются с реальным кадром после warmup
     width: int = 1280
     height: int = 720
 
-    # --- визуализация / вывод ---
+    # --- визуализация / запись ---
     display: bool = False
     save_vis: bool = False
 
@@ -94,11 +94,12 @@ class AppConfig:
     mjpeg_q: int = 6
     ff_threads: int = 3
 
-    # --- размеры окна показа ---
+    # --- highgui ---
     display_max_w: int = 1920
     display_max_h: int = 1080
+    window: str = "normal"        # "normal" | "autosize"
 
-    # --- снапшоты детекций ---
+    # --- снапшоты ---
     snapshots: bool = False
     snap_dir: str = "detections"
     snap_min_cc: float = 0.6
@@ -113,4 +114,10 @@ class AppConfig:
 
     # --- синхронизация L/R ---
     sync_max_dt: float = 0.05  # сек
+
+    # --- системные/бэкенд опции OpenCV ---
+    cap_buffersize: int = 1     # CAP_PROP_BUFFERSIZE для сетевых потоков
+    cv_threads: int = 0         # 0 = по умолчанию OpenCV, >0 = setNumThreads(N)
+    use_optimized: bool = True  # setUseOptimized(flag)
+    print_fps: bool = False     # печать FPS цикла
 
