@@ -1,70 +1,124 @@
+# visual_radar/stereo.py
+from __future__ import annotations
+
 from typing import List, Tuple, Optional
 import numpy as np
 import cv2 as cv
-from .utils import BBox, to_bbox, clamp
 
-def ncc(a, b):
-    a = a.astype(np.float32); b = b.astype(np.float32)
-    am = a - a.mean(); bm = b - b.mean()
-    denom = (np.linalg.norm(am)*np.linalg.norm(bm) + 1e-6)
-    return float((am*bm).sum()/denom)
+from visual_radar.utils import BBox
 
-def match_template_ncc(search_img, templ):
-    res = cv.matchTemplate(search_img, templ, cv.TM_CCOEFF_NORMED)
-    minv, maxv, minloc, maxloc = cv.minMaxLoc(res)
-    return maxv, maxloc
 
-def gate_pairs_rectified(boxesL: List[BBox], boxesR: List[BBox], y_eps:int, dmin:int, dmax:int) -> List[Tuple[int,int]]:
-    pairs = []
-    for i,bl in enumerate(boxesL):
-        best_j = -1; best_cost = 1e9
-        for j,br in enumerate(boxesR):
-            if abs(bl.cy - br.cy) > y_eps: 
+def gate_pairs_rectified(
+    boxesL: List[BBox],
+    boxesR: List[BBox],
+    y_eps: float = 6.0,
+    dmin: float = -512.0,
+    dmax: float = 512.0,
+) -> List[Tuple[int, int]]:
+    """
+    Жадное сопоставление L/R-боксов на РЕКТИФИЦИРОВАННЫХ кадрах.
+    Условие: |cyL - cyR| <= y_eps и disparity d = (cxL - cxR) в [dmin, dmax].
+    Возвращает пары индексов (iL, iR).
+    """
+    if not boxesL or not boxesR:
+        return []
+
+    # Кандидаты: список (iL, iR, score), где score = |разность центров по X|
+    cands: List[Tuple[int, int, float]] = []
+    for i, bl in enumerate(boxesL):
+        for j, br in enumerate(boxesR):
+            if abs(bl.cy - br.cy) > float(y_eps):
                 continue
-            disp = abs(bl.cx - br.cx)
-            if disp < dmin or disp > dmax: 
+            d = float(bl.cx - br.cx)
+            if d < float(dmin) or d > float(dmax):
                 continue
-            cost = abs(bl.cy - br.cy) + 0.1*abs(disp - (dmin+dmax)/2.0)
-            if cost < best_cost:
-                best_cost = cost; best_j = j
-        if best_j >= 0:
-            pairs.append((i,best_j))
+            score = abs(d)  # чем меньше модуль диспаритета, тем "плотнее" пара
+            cands.append((i, j, score))
+
+    if not cands:
+        return []
+
+    # Жадно берём лучшие соответствия, не допуская повторов индексов
+    cands.sort(key=lambda t: t[2])  # по возрастанию |d|
+    usedL = set()
+    usedR = set()
+    pairs: List[Tuple[int, int]] = []
+    for i, j, _ in cands:
+        if i in usedL or j in usedR:
+            continue
+        usedL.add(i)
+        usedR.add(j)
+        pairs.append((i, j))
     return pairs
 
-def epipolar_ncc_match(rectL_gray, rectR_gray, boxL: BBox, search_pad:int, patch:int, ncc_min:float) -> Optional[BBox]:
-    h,w = rectL_gray.shape[:2]
-    half = patch//2
-    x0 = int(clamp(boxL.cx - half, 0, w-1))
-    y0 = int(clamp(boxL.cy - half, 0, h-1))
-    x1 = int(clamp(x0 + patch, 0, w)); y1 = int(clamp(y0 + patch, 0, h))
-    templ = rectL_gray[y0:y1, x0:x1]
-    if templ.shape[0] < patch//2 or templ.shape[1] < patch//2:
+
+def _crop_patch(img: np.ndarray, cx: float, cy: float, half: int) -> Optional[np.ndarray]:
+    """Вырезать квадратный патч с центром (cx, cy) и половинкой размера half."""
+    h, w = img.shape[:2]
+    x1 = int(round(cx)) - half
+    y1 = int(round(cy)) - half
+    x2 = x1 + 2 * half + 1
+    y2 = y1 + 2 * half + 1
+    if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
+        return None
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(w, x2); y2 = min(h, y2)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    return img[y1:y2, x1:x2]
+
+
+def epipolar_ncc_match(
+    grayL: np.ndarray,
+    grayR: np.ndarray,
+    boxL: BBox,
+    search_pad: int = 64,
+    patch_size: int = 13,
+    ncc_min: float = 0.25,
+) -> Optional[BBox]:
+    """
+    Поиск соответствия для левого бокса вдоль эпиполярной строки (горизонтали) в правом кадре
+    с помощью NCC (cv.matchTemplate, TM_CCOEFF_NORMED).
+
+    Возвращает правый BBox (того же размера, что и левый), либо None при неудаче.
+    """
+    gL = grayL if grayL.ndim == 2 else cv.cvtColor(grayL, cv.COLOR_BGR2GRAY)
+    gR = grayR if grayR.ndim == 2 else cv.cvtColor(grayR, cv.COLOR_BGR2GRAY)
+
+    half = max(2, int(patch_size) // 2)
+    tpl = _crop_patch(gL, boxL.cx, boxL.cy, half)
+    if tpl is None:
         return None
 
-    sx0 = int(clamp(boxL.cx - search_pad, 0, w-1))
-    sx1 = int(clamp(boxL.cx + search_pad, 0, w))
-    sy0 = int(clamp(boxL.cy - search_pad//6, 0, h-1))
-    sy1 = int(clamp(boxL.cy + search_pad//6, 0, h))
-    search = rectR_gray[sy0:sy1, sx0:sx1]
-    if search.shape[0] < templ.shape[0] or search.shape[1] < templ.shape[1]:
+    h, w = gR.shape[:2]
+    # Поиск в горизонтальном окне вокруг cx (± search_pad) с небольшой свободы по Y (± 2)
+    x1 = max(0, int(round(boxL.cx)) - int(search_pad))
+    x2 = min(w, int(round(boxL.cx)) + int(search_pad))
+    y = int(round(boxL.cy))
+    y1 = max(0, y - 2)
+    y2 = min(h, y + 3)
+
+    if x2 - x1 < tpl.shape[1] + 2 or y2 - y1 < tpl.shape[0] + 2:
+        # слишком узкое окно поиска
         return None
 
-    score, loc = match_template_ncc(search, templ)
-    if score < ncc_min:
-        return None
-    px,py = loc
-    rx = sx0 + px; ry = sy0 + py
-    rb = to_bbox(rx, ry, templ.shape[1], templ.shape[0])
-    return rb
-
-def rectified_pair(calib, frameL, frameR):
+    roi = gR[y1:y2, x1:x2]
     try:
-        rmapL = getattr(calib, "rmapL", None)
-        rmapR = getattr(calib, "rmapR", None)
-        if rmapL is not None and rmapR is not None:
-            rL = cv.remap(frameL, rmapL[0], rmapL[1], interpolation=cv.INTER_LINEAR)
-            rR = cv.remap(frameR, rmapR[0], rmapR[1], interpolation=cv.INTER_LINEAR)
-            return rL, rR
-    except Exception:
-        pass  
-    return frameL, frameR
+        res = cv.matchTemplate(roi, tpl, cv.TM_CCOEFF_NORMED)
+    except cv.error:
+        return None
+
+    min_val, max_val, min_loc, max_loc = cv.minMaxLoc(res)
+    if float(max_val) < float(ncc_min):
+        return None
+
+    # координаты в правом кадре
+    top_left = (x1 + max_loc[0], y1 + max_loc[1])
+    cxR = top_left[0] + tpl.shape[1] * 0.5
+    cyR = top_left[1] + tpl.shape[0] * 0.5
+
+    # Возвращаем бокс того же размера, что и левый
+    return BBox(float(cxR - boxL.w * 0.5),
+                float(cyR - boxL.h * 0.5),
+                float(boxL.w),
+                float(boxL.h))

@@ -1,107 +1,177 @@
+# visual_radar/motion.py
+from __future__ import annotations
 
-from typing import Tuple, List, Optional
+from typing import List, Tuple
 import numpy as np
 import cv2 as cv
-from .utils import BBox, to_bbox, clamp
 
-def as_gray(img):
-    if img.ndim == 2:
-        return img
-    return cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+from visual_radar.utils import BBox
 
-class DualBGModel:
-    """Dual-timescale running averages: fast and slow. Produces foreground mask."""
-    def __init__(self, shape, alpha_fast=0.08, alpha_slow=0.005):
-        self.fast = None
-        self.slow = None
-        self.alpha_fast = alpha_fast
-        self.alpha_slow = alpha_slow
-        self.shape = shape
 
-    def update(self, gray):
-        g = gray.astype(np.float32)
-        if self.fast is None:
-            self.fast = g.copy()
-            self.slow = g.copy()
-        self.fast = (1-self.alpha_fast)*self.fast + self.alpha_fast*g
-        self.slow = (1-self.alpha_slow)*self.slow + self.alpha_slow*g
-        df = cv.absdiff(g, self.fast).astype(np.float32)
-        ds = cv.absdiff(g, self.slow).astype(np.float32)
-        return df, ds
-
-def compute_mad(img, sample_fraction=0.1):
-    h,w = img.shape[:2]
-    step = max(1, int(1/np.sqrt(sample_fraction)))
-    sample = img[::step, ::step].astype(np.float32)
-    med = np.median(sample)
-    mad = np.median(np.abs(sample - med)) + 1e-6
-    return 1.4826 * mad  # ≈ sigma
-
-def adaptive_threshold_from_noise(gray, user_thr_fast: Optional[float], user_thr_slow: Optional[float]):
-    sigma = compute_mad(gray)
-    base = 3.0 * sigma
-    thr_fast = clamp(user_thr_fast if user_thr_fast is not None else base, 3.0, 20.0)
-    thr_slow = clamp(user_thr_slow if user_thr_slow is not None else base*0.7, 2.0, 15.0)
-    return thr_fast, thr_slow
-
-def find_motion_bboxes(gray, bg: DualBGModel,
-                       min_area:int, max_area:int,
-                       thr_fast:Optional[float], thr_slow: Optional[float],
-                       use_clahe=True,
-                       size_aware_morph=True) -> Tuple[np.ndarray, List[BBox]]:
-    if use_clahe:
-        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        g = clahe.apply(gray)
+# -----------------------------
+# helpers
+# -----------------------------
+def as_gray(img) -> np.ndarray:
+    """RGB/BGR -> GRAY uint8."""
+    if img is None:
+        raise ValueError("as_gray: None image")
+    if len(img.shape) == 2:
+        g = img
     else:
-        g = gray
+        g = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    if g.dtype != np.uint8:
+        g = cv.normalize(g, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+    return g
 
-    tf, ts = adaptive_threshold_from_noise(g, thr_fast, thr_slow)
-    df, ds = bg.update(g)
-    fg = ((df > tf) | (ds > ts)).astype(np.uint8)*255
 
+def _kernel_from_area(min_area: int, boost: float = 1.0) -> Tuple[int, int]:
+    """
+    Подбираем размер структурирующего элемента по площади.
+    min_area ~ k^2 → k ~ sqrt(min_area).
+    """
+    k = int(max(3, np.sqrt(max(1, float(min_area))) * 0.50 * float(boost)))
+    # делаем нечётным
+    if k % 2 == 0:
+        k += 1
+    k = int(np.clip(k, 3, 21))  # разумные пределы
+    return k, k
+
+
+def _morph_clean(mask: np.ndarray, min_area: int, size_aware_morph: bool = True) -> np.ndarray:
+    if mask is None or mask.size == 0:
+        return mask
+    mask = (mask > 0).astype(np.uint8) * 255
     if size_aware_morph:
-        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3,3))
-        fg = cv.morphologyEx(fg, cv.MORPH_OPEN, kernel, iterations=1)
-        fg_hat = cv.morphologyEx(g, cv.MORPH_TOPHAT, kernel, iterations=1)
-        fg = cv.max(fg, (fg_hat > tf).astype(np.uint8)*255)
-        fg = cv.dilate(fg, kernel, iterations=1)
-
-    contours, _ = cv.findContours(fg, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    boxes: List[BBox] = []
-    for c in contours:
-        x,y,w,h = cv.boundingRect(c)
-        area = w*h
-        if area < min_area: continue
-        if max_area > 0 and area > max_area: continue
-        boxes.append(to_bbox(x,y,w,h))
-    return fg, boxes
-
-def make_masks_static_and_slow(gray, bg: DualBGModel,
-                               thr_fast: float, thr_slow: float,
-                               use_clahe=True, kernel_size=3):
-    """
-    Returns (mask_static_removed, mask_slow_dynamic_removed).
-    - mask_static_removed: foreground by fast difference (removes static background)
-    - mask_slow_dynamic_removed: fast - slow, zero where slow > thr_slow (removes slow clouds)
-    """
-    if use_clahe:
-        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        g = clahe.apply(gray)
+        kx, ky = _kernel_from_area(min_area)
     else:
-        g = gray
+        kx = ky = 3
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kx, ky))
+    # open -> remove noise; close a bit to connect
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, iterations=1)
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, iterations=1)
+    return mask
 
-    df, ds = bg.update(g)
-    fast = cv.convertScaleAbs(df); slow = cv.convertScaleAbs(ds)
 
-    _, m_static = cv.threshold(fast, thr_fast, 255, cv.THRESH_BINARY)
+def _boxes_from_mask(mask: np.ndarray, min_area: int, max_area: int) -> List[BBox]:
+    boxes: List[BBox] = []
+    if mask is None or mask.size == 0:
+        return boxes
+    cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        x, y, w, h = cv.boundingRect(c)
+        area = int(w) * int(h)
+        if area < max(1, int(min_area)):
+            continue
+        if max_area and area > int(max_area):
+            continue
+        boxes.append(BBox(float(x), float(y), float(w), float(h)))
+    return boxes
 
-    resp = cv.subtract(fast, slow)
-    _, m_slow = cv.threshold(resp, thr_fast, 255, cv.THRESH_BINARY)
-    m_slow[slow > thr_slow] = 0
 
-    K = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    m_static = cv.morphologyEx(m_static, cv.MORPH_OPEN, K, iterations=1)
-    m_slow   = cv.morphologyEx(m_slow,   cv.MORPH_OPEN, K, iterations=1)
-    m_static = cv.dilate(m_static, K, iterations=1)
-    m_slow   = cv.dilate(m_slow,   K, iterations=1)
-    return m_static, m_slow
+# -----------------------------
+# Background models
+# -----------------------------
+class DualBGModel:
+    """
+    Две фоновые модели:
+      - fast: короткая память → выделяет быстрое движение (паруса, птицы, волны)
+      - slow: длинная память → улавливает медленный дрейф (облака/общая яркость)
+    Реализация на MOG2, т.к. он стабильно работает на Win/FFmpeg.
+    """
+    def __init__(self, shape_hw: Tuple[int, int]):
+        h, w = int(shape_hw[0]), int(shape_hw[1])
+        # Параметры подобраны практично; при желании можно прокинуть в SMDParams
+        self.fast = cv.createBackgroundSubtractorMOG2(history=50, varThreshold=16, detectShadows=False)
+        self.slow = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=12, detectShadows=False)
+
+    def apply_fast(self, gray: np.ndarray) -> np.ndarray:
+        fg = self.fast.apply(gray, learningRate=-1)  # авто LR
+        return (fg > 0).astype(np.uint8) * 255
+
+    def apply_slow(self, gray: np.ndarray) -> np.ndarray:
+        fg = self.slow.apply(gray, learningRate=-1)
+        return (fg > 0).astype(np.uint8) * 255
+
+
+# -----------------------------
+# Motion masks
+# -----------------------------
+def find_motion_bboxes(
+    gray: np.ndarray,
+    bg: DualBGModel,
+    min_area: int,
+    max_area: int,
+    thr_fast: float,
+    thr_slow: float,
+    use_clahe: bool = True,
+    size_aware_morph: bool = True,
+) -> Tuple[np.ndarray, List[BBox]]:
+    """
+    Главная функция: получить маску движения и список боксов.
+    - Делаем (опционально) CLAHE для устойчивости к неравномерной экспозиции.
+    - Получаем две маски от "быстрой" и "медленной" модели.
+    - Усиливаем, чистим морфологией, фильтруем по площади.
+    Возвращает (mask, boxes). В большинстве мест дальше используется только mask.
+    """
+    g = gray
+    if use_clahe:
+        # CLAHE помогает на воде с бликами и ползущим градиентом в небе
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(g)
+
+    mf = bg.apply_fast(g)
+    ms = bg.apply_slow(g)
+
+    # Пороговые коэффициенты можно использовать как "вес" вкладов масок:
+    alpha = float(max(0.0, thr_fast))
+    beta = float(max(0.0, thr_slow))
+    # нормализуем веса в [0..1], чтобы не взрывать значения
+    denom = max(1e-6, alpha + beta)
+    alpha /= denom
+    beta /= denom
+
+    mix = cv.addWeighted(mf, alpha, ms, beta, 0.0)
+    mix = (mix > 0).astype(np.uint8) * 255
+
+    # Очистка по морфологии
+    mask = _morph_clean(mix, int(min_area), bool(size_aware_morph))
+    boxes = _boxes_from_mask(mask, int(min_area), int(max_area))
+    return mask, boxes
+
+
+def make_masks_static_and_slow(
+    gray: np.ndarray,
+    bg: DualBGModel,
+    thr_fast: float,
+    thr_slow: float,
+    use_clahe: bool = True,
+    kernel_size: int = 3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Вернуть две маски:
+      - static: консервативная (почти-статичный фон) — может использоваться для подавления шума
+      - slow: медленный дрейф (облака и т.п.), чтобы "смягчить" верхнюю часть кадра
+    На практике в проекте используется в небе: заменяем там fast-маску на медленную.
+    """
+    g = gray
+    if use_clahe:
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g = clahe.apply(g)
+
+    mf = bg.apply_fast(g)
+    ms = bg.apply_slow(g)
+
+    # "static" — всё, что НЕ отмечено как быстро меняющееся (инверт fast),
+    # но оставим только те области, где slow тоже спокоен → уменьшаем фантомы.
+    k = max(3, int(kernel_size) | 1)
+    ker = cv.getStructuringElement(cv.MORPH_ELLIPSE, (k, k))
+
+    fast_bin = (mf > 0).astype(np.uint8) * 255
+    slow_bin = (ms > 0).astype(np.uint8) * 255
+
+    static = cv.bitwise_not(fast_bin)
+    static = cv.morphologyEx(static, cv.MORPH_OPEN, ker, iterations=1)
+
+    slow = cv.morphologyEx(slow_bin, cv.MORPH_OPEN, ker, iterations=1)
+    return static, slow
+
