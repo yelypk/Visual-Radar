@@ -24,7 +24,7 @@ def _is_rtsp(url: str) -> bool:
 class FFmpegRTSP_MJPEG:
     """
     RTSP → ffmpeg (TCP) → MJPEG по pipe → cv2.imdecode
-    API: read() -> (ok, frame, ts), isOpened(), release()
+    API: read() -> (ok, frame, ts), isOpened(), reopen(), release()
     """
 
     def __init__(
@@ -70,7 +70,7 @@ class FFmpegRTSP_MJPEG:
             "-hide_banner", "-loglevel", "warning",
             "-rtsp_transport", "tcp" if self.use_tcp else "udp",
             "-rtsp_flags", "prefer_tcp",
-            "-rw_timeout", "5000000",          # 5s I/O timeout (кроссплатформенно)
+            "-rw_timeout", "5000000",          # 5s I/O timeout кроссплатформенно
             "-analyzeduration", "10000000",
             "-probesize", "10000000",
             "-fflags", "+genpts+igndts",
@@ -136,8 +136,7 @@ class FFmpegRTSP_MJPEG:
     def read(self):
         # авто-репуск ffmpeg, если процесс умер
         if self.proc is None or self.proc.poll() is not None:
-            self.release()
-            self._start()
+            self.reopen()
             time.sleep(0.1)
         try:
             jpg = self._q.get(timeout=self.read_timeout)
@@ -147,6 +146,10 @@ class FFmpegRTSP_MJPEG:
         if img is None:
             return False, None, None
         return True, img, now_s()
+
+    def reopen(self) -> None:
+        self.release()
+        self._start()
 
     def release(self) -> None:
         try:
@@ -171,44 +174,64 @@ class FFmpegRTSP_MJPEG:
 class RTSPReader:
     """
     OpenCV VideoCapture с FFMPEG backend.
-    - RTSP/TCP через OPENCV_FFMPEG_CAPTURE_OPTIONS
-    - CAP_PROP_BUFFERSIZE для сетевых потоков
+    - RTSP/TCP и таймауты через OPENCV_FFMPEG_CAPTURE_OPTIONS
+    - CAP_PROP_BUFFERSIZE для низкой задержки (сетевые потоки)
+    - CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC (если доступны)
     - CAP_PROP_CONVERT_RGB=1
-    - Для RTSP не меняем CAP_PROP_FRAME_* (смещения/«полосы»)
+    - Для RTSP не меняем CAP_PROP_FRAME_* (иначе полосы/смещения)
+    API: read() -> (ok, frame, ts), reopen(), release()
     """
+
     def _set_default_ffmpeg_opts(self):
         env = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         if not env:
+            # единый формат key;val|key;val (docs)
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                "rtsp_transport;tcp|stimeout;3000000|max_delay;500000|buffer_size;1048576"
+                "rtsp_transport;tcp|stimeout;5000000|max_delay;500000|buffer_size;1048576"
             )
 
     def __init__(self, url: str, width: Optional[int], height: Optional[int], cap_buffersize: Optional[int] = None):
+        self.url = url
+        self.w = int(width) if width else 0
+        self.h = int(height) if height else 0
+        self.cap_buffersize = int(cap_buffersize) if cap_buffersize is not None else 1
+        self._open()
+
+    def _open(self):
         try:
             self._set_default_ffmpeg_opts()
         except Exception:
             pass
-        self.cap = cv.VideoCapture(url, cv.CAP_FFMPEG)
+
+        self.cap = cv.VideoCapture(self.url, cv.CAP_FFMPEG)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open stream: {url}")
+            raise RuntimeError(f"Cannot open stream: {self.url}")
 
         # уменьшить внутренний буфер, если это RTSP
-        if _is_rtsp(url):
+        if _is_rtsp(self.url):
             try:
-                self.cap.set(cv.CAP_PROP_BUFFERSIZE, int(cap_buffersize if cap_buffersize is not None else 1))
+                self.cap.set(cv.CAP_PROP_BUFFERSIZE, self.cap_buffersize)
             except Exception:
                 pass
+            # новые пропсы таймаутов (если присутствуют в твоей сборке OpenCV)
+            for prop, val in [(getattr(cv, "CAP_PROP_OPEN_TIMEOUT_MSEC", None), 4000),
+                              (getattr(cv, "CAP_PROP_READ_TIMEOUT_MSEC", None), 4000)]:
+                if prop is not None:
+                    try:
+                        self.cap.set(prop, val)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
 
-        # гарантируем BGR uint8 (см. docs: CAP_PROP_CONVERT_RGB)
+        # гарантируем BGR uint8
         try:
             self.cap.set(cv.CAP_PROP_CONVERT_RGB, 1)
         except Exception:
             pass
 
         # Размер не трогаем для RTSP. Для локальных файлов/USB-камер можно.
-        if width and height and not _is_rtsp(url):
-            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, int(width))
-            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, int(height))
+        if self.w and self.h and not _is_rtsp(self.url):
+            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.w)
+            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.h)
 
     def isOpened(self) -> bool:
         return self.cap.isOpened()
@@ -220,6 +243,13 @@ class RTSPReader:
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8, copy=False)
         return True, frame, now_s()
+
+    def reopen(self) -> None:
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        self._open()
 
     def release(self) -> None:
         try:
@@ -255,3 +285,4 @@ def make_writer(path: str, frame_size: Tuple[int, int], fps: float = 20.0):
     if not writer.isOpened():
         raise RuntimeError(f"Cannot open VideoWriter: {path}")
     return writer
+

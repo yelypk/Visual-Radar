@@ -1,3 +1,4 @@
+# visual_radar/cli.py
 from __future__ import annotations
 
 import time
@@ -10,12 +11,15 @@ import numpy as np
 from visual_radar.config import AppConfig, SMDParams
 from visual_radar.calibration import load_calibration, rectified_pair
 from visual_radar.io import open_stream, make_writer
-from visual_radar.visualize import draw_boxes, stack_lr, imshow_resized
+from visual_radar.visualize import draw_boxes, stack_lr, imshow_resized, draw_hud
 from visual_radar.snapshots import SnapshotSaver
 from visual_radar.tracks import BoxTracker
 from visual_radar.detector import StereoMotionDetector
 
 
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 def build_parser():
     import argparse
     p = argparse.ArgumentParser("visual_radar")
@@ -59,11 +63,11 @@ def build_parser():
     p.add_argument("--noise_k_fast", type=float, default=2.0)
     p.add_argument("--noise_k_slow", type=float, default=1.0)
 
-    # персистентность масок
+    # персистентность
     p.add_argument("--persist_k", type=int, default=4)
     p.add_argument("--persist_m", type=int, default=3)
 
-    # подрезка/ROI
+    # ROI/кроп
     p.add_argument("--crop_top", type=int, default=0)
     p.add_argument("--roi_mask", type=str, default=None)
 
@@ -93,14 +97,20 @@ def build_parser():
 
     # синхронизация
     p.add_argument("--sync_max_dt", type=float, default=0.05)
+    p.add_argument("--sync_attempts", type=int, default=4)
 
-    # системные/бэкенд опции OpenCV
-    p.add_argument("--cap_buffersize", type=int, default=1, help="CAP_PROP_BUFFERSIZE для сетевых потоков")
-    p.add_argument("--cv_threads", type=int, default=0, help="0=по умолчанию OpenCV; >0 — setNumThreads(N)")
-    p.add_argument("--no_optimized", action="store_true", help="отключить setUseOptimized(True)")
+    # здоровье потоков
+    p.add_argument("--cap_buffersize", type=int, default=1)
+    p.add_argument("--stall_timeout", type=float, default=3.0)
+    p.add_argument("--max_consec_fail", type=int, default=30)
 
-    # отладка
-    p.add_argument("--print_fps", action="store_true", help="печать FPS главного цикла")
+    # системные/бэкенд
+    p.add_argument("--cv_threads", type=int, default=0)
+    p.add_argument("--no_optimized", action="store_true")
+    p.add_argument("--print_fps", action="store_true")
+
+    # фильтр «битых» кадров
+    p.add_argument("--no_drop_artifacts", action="store_true")
 
     return p
 
@@ -145,26 +155,81 @@ def args_to_config(args) -> AppConfig:
         snap_min_cc=float(args.snap_min_cc), snap_min_disp=float(args.snap_min_disp),
         snap_pad=int(args.snap_pad), snap_cooldown=float(args.snap_cooldown), snap_debug=bool(args.snap_debug),
         save_path=args.save_path, save_fps=float(args.save_fps),
-        sync_max_dt=float(args.sync_max_dt),
+        sync_max_dt=float(args.sync_max_dt), sync_attempts=int(args.sync_attempts),
         cap_buffersize=int(args.cap_buffersize),
-        cv_threads=int(args.cv_threads),
-        use_optimized=not bool(args.no_optimized),
+        stall_timeout=float(args.stall_timeout), max_consec_fail=int(args.max_consec_fail),
+        cv_threads=int(args.cv_threads), use_optimized=not bool(args.no_optimized),
         print_fps=bool(args.print_fps),
+        drop_artifacts=not bool(args.no_drop_artifacts),
     )
 
 
-def warmup(reader, name: str, timeout_s: float = 20.0):
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+def _is_artifact_frame(bgr: np.ndarray) -> bool:
+    """
+    Грубая эвристика «битого» кадра:
+    - берём нижние 40% кадра, считаем std по колонкам;
+    - чрезмерная вертикальная дисперсия → полосы/обрыв пакетов;
+    - дополнительный триггер — почти константный кадр (очень малая std).
+    """
+    if bgr is None or bgr.size == 0:
+        return True
+    g = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
+    h, w = g.shape[:2]
+    band = g[int(h * 0.6):, :]
+    if band.size == 0:
+        return False
+    sigma_all = float(band.std())
+    if sigma_all < 1.0:
+        return True
+    col_std = band.std(axis=0)
+    if float(np.median(col_std)) > (sigma_all * 2.5):
+        return True
+    return False
+
+
+def warmup(reader, timeout_s: float = 20.0):
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         ok, fr, ts = reader.read()
-        if ok:
+        if ok and fr is not None:
             return True, fr, ts
         time.sleep(0.05)
     return False, None, None
 
 
+def _sync_pair(L, R, dt_max: float, attempts: int):
+    """
+    Активная синхронизация: если |dt|>dt_max — дочитываем «отстающую» сторону
+    до attempts раз, чтобы быстро выровнять потоки.
+    """
+    okL, fL, tL = L.read()
+    okR, fR, tR = R.read()
+    if not okL or not okR:
+        return False, None, None, None, None
+    tries = 0
+    while abs(float(tL) - float(tR)) > dt_max and tries < attempts:
+        if tL < tR:
+            okL, fL, tL = L.read()
+            if not okL:
+                return False, None, None, None, None
+        else:
+            okR, fR, tR = R.read()
+            if not okR:
+                return False, None, None, None, None
+        tries += 1
+    if abs(float(tL) - float(tR)) > dt_max:
+        return False, None, None, None, None
+    return True, fL, fR, tL, tR
+
+
+# -----------------------------------------------------------------------------
+# main loop
+# -----------------------------------------------------------------------------
 def run(cfg: AppConfig):
-    # глобальные настройки OpenCV (docs: setNumThreads / setUseOptimized)
+    # глобальные настройки OpenCV
     if cfg.cv_threads and cfg.cv_threads > 0:
         cv.setNumThreads(int(cfg.cv_threads))
     cv.setUseOptimized(bool(cfg.use_optimized))
@@ -178,30 +243,20 @@ def run(cfg: AppConfig):
                     mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
                     cap_buffersize=cfg.cap_buffersize)
 
-    okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
-    okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
-
-    if (not okL or not okR) and cfg.reader == "ffmpeg_mjpeg":
-        print("[warmup] no frames via ffmpeg_mjpeg → fallback to opencv")
-        try: L.release(); R.release()
-        except Exception: pass
-        L = open_stream(cfg.left, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
-                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads, cap_buffersize=cfg.cap_buffersize)
-        R = open_stream(cfg.right, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
-                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads, cap_buffersize=cfg.cap_buffersize)
-        okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
-        okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
+    okL, fL0, _ = warmup(L, timeout_s=20.0)
+    okR, fR0, _ = warmup(R, timeout_s=20.0)
 
     if not okL or not okR:
         print("[warmup] no frames within 20s. stop.")
-        try: L.release(); R.release()
-        except Exception: pass
+        try:
+            L.release(); R.release()
+        except Exception:
+            pass
         return
 
-    # синхронизируем размеры с реальными (docs: не полагаться на set/get для сетевых источников)
+    # синхронизируем размеры с реальными
     h0, w0 = fL0.shape[:2]
-    if (cfg.width, cfg.height) != (w0, h0):
-        cfg.width, cfg.height = w0, h0
+    cfg.width, cfg.height = w0, h0
 
     # окно
     if cfg.display:
@@ -248,91 +303,107 @@ def run(cfg: AppConfig):
     writer = None
     sp = Path(cfg.save_path) if cfg.save_vis else None
 
+    # здоровье/переподключение
+    last_ok = time.time()
+    failL = failR = 0
+
     # FPS печать
     t_fps = time.perf_counter()
     fps_cnt = 0
+    loop_fps = 0.0
 
     print("[*] Running.  Press ESC to stop.")
     try:
         while True:
-            okL, fL, tL = L.read()
-            okR, fR, tR = R.read()
-            if not okL or not okR:
-                continue
+            ok, fL, fR, tL, tR = _sync_pair(L, R, cfg.sync_max_dt, cfg.sync_attempts)
+            if not ok:
+                # грубо считаем индивидуальные фейлы источников
+                okl, _, _ = L.read()
+                okr, _, _ = R.read()
+                failL += int(not okl)
+                failR += int(not okr)
+            else:
+                # фильтр «битых» кадров
+                if cfg.drop_artifacts and (_is_artifact_frame(fL) or _is_artifact_frame(fR)):
+                    continue
 
-            # гейт по рассинхрону
-            if abs(float(tL) - float(tR)) > float(cfg.sync_max_dt):
-                continue
+                failL = failR = 0
+                last_ok = time.time()
 
-            rL, rR = rectified_pair(calib, fL, fR)
-            mL, mR, boxesL, boxesR, pairs = det.step(rL, rR)
+                rL, rR = rectified_pair(calib, fL, fR)
+                _mL, _mR, boxesL, boxesR, pairs = det.step(rL, rR)
 
-            # стерео-фильтр по минимальному диспаритету
-            if pairs:
-                disp_thr = float(cfg.smd.min_disp_pair)
-                new_pairs, keepL_idx, keepR_idx = [], set(), set()
-                for (i, j) in pairs:
-                    if i < len(boxesL) and j < len(boxesR):
-                        disp = float(boxesL[i].cx - boxesR[j].cx)
-                        if abs(disp) >= disp_thr:
-                            new_pairs.append((i, j))
-                            keepL_idx.add(i); keepR_idx.add(j)
-                if new_pairs:
-                    idxL = sorted(keepL_idx); idxR = sorted(keepR_idx)
-                    mapL = {old: k for k, old in enumerate(idxL)}
-                    mapR = {old: k for k, old in enumerate(idxR)}
-                    boxesL = [boxesL[k] for k in idxL]
-                    boxesR = [boxesR[k] for k in idxR]
-                    pairs = [(mapL[i], mapR[j]) for (i, j) in new_pairs]
-                else:
-                    boxesL, boxesR, pairs = [], [], []
+                keepL: Set[int] = trL.update(boxesL)
+                keepR: Set[int] = trR.update(boxesR)
+                boxesL = [b for i, b in enumerate(boxesL) if i in keepL]
+                boxesR = [b for i, b in enumerate(boxesR) if i in keepR]
 
-            keepL: Set[int] = trL.update(boxesL)
-            keepR: Set[int] = trR.update(boxesR)
-            boxesL = [b for i, b in enumerate(boxesL) if i in keepL]
-            boxesR = [b for i, b in enumerate(boxesR) if i in keepR]
+                visL = rL.copy()
+                visR = rR.copy()
+                draw_boxes(visL, boxesL, (0, 255, 0), "L")
+                draw_boxes(visR, boxesR, (255, 0, 0), "R")
+                vis = stack_lr(visL, visR)
 
-            if pairs:
-                idxL = {i: k for k, i in enumerate(sorted(keepL))}
-                idxR = {j: k for k, j in enumerate(sorted(keepR))}
-                pairs = [(idxL[i], idxR[j]) for (i, j) in pairs if i in idxL and j in idxR]
+                # HUD
+                dt_ms = int(abs(float(tL) - float(tR)) * 1000.0)
+                hud_lines = [
+                    f"dt: {dt_ms} ms  (thr {int(cfg.sync_max_dt*1000)} ms)",
+                    f"night: {det.is_night}",
+                    f"fails L/R: {failL}/{failR}",
+                    f"fps: {loop_fps:.1f}",
+                ]
+                draw_hud(vis, hud_lines, corner="tr")
 
-            visL = rL.copy(); visR = rR.copy()
-            draw_boxes(visL, boxesL, (0, 255, 0), "L")
-            draw_boxes(visR, boxesR, (255, 0, 0), "R")
-            vis = stack_lr(visL, visR)
+                if cfg.save_vis:
+                    if writer is None:
+                        h, w = vis.shape[:2]
+                        writer = make_writer(str(sp), (w, h), fps=cfg.save_fps)
+                    writer.write(vis)
 
-            if cfg.save_vis:
-                if writer is None:
-                    h, w = vis.shape[:2]
-                    writer = make_writer(str(sp), (w, h), fps=cfg.save_fps)
-                writer.write(vis)
+                if cfg.display:
+                    imshow_resized("VisualRadar L|R", vis, cfg.display_max_w, cfg.display_max_h)
+                    if (cv.waitKey(1) & 0xFF) == 27:
+                        break
 
-            if cfg.display:
-                imshow_resized("VisualRadar L|R", vis, cfg.display_max_w, cfg.display_max_h)
-                if (cv.waitKey(1) & 0xFF) == 27:
-                    break
+                if saver is not None and pairs:
+                    Q = getattr(calib, "Q", None) if hasattr(calib, "Q") else None
+                    for (i, j) in pairs:
+                        if i >= len(boxesL) or j >= len(boxesR):
+                            continue
+                        bl, br = boxesL[i], boxesR[j]
+                        disp = float(bl.cx - br.cx)
+                        saver.maybe_save(
+                            rL, rR,
+                            (int(bl.x), int(bl.y), int(bl.w), int(bl.h)),
+                            (int(br.x), int(br.y), int(br.w), int(br.h)),
+                            disp, Q=Q,
+                        )
 
-            if saver is not None and pairs:
-                Q = getattr(calib, "Q", None) if hasattr(calib, "Q") else None
-                for (i, j) in pairs:
-                    if i >= len(boxesL) or j >= len(boxesR):
-                        continue
-                    bl, br = boxesL[i], boxesR[j]
-                    disp = float(bl.cx - br.cx)
-                    saver.maybe_save(
-                        rL, rR,
-                        (int(bl.x), int(bl.y), int(bl.w), int(bl.h)),
-                        (int(br.x), int(br.y), int(br.w), int(br.h)),
-                        disp, Q=Q,
-                    )
+                # FPS
+                fps_cnt += 1
+                if cfg.print_fps and (time.perf_counter() - t_fps) >= 1.0:
+                    loop_fps = float(fps_cnt) / (time.perf_counter() - t_fps)
+                    print(f"[loop] {loop_fps:.1f} FPS")
+                    fps_cnt = 0
+                    t_fps = time.perf_counter()
 
-            # FPS
-            fps_cnt += 1
-            if cfg.print_fps and (time.perf_counter() - t_fps) >= 1.0:
-                print(f"[loop] {fps_cnt} FPS")
-                fps_cnt = 0
-                t_fps = time.perf_counter()
+            # переподключение при тишине или частых фейлах
+            if (time.time() - last_ok) > cfg.stall_timeout or failL >= cfg.max_consec_fail:
+                print("[health] reopen LEFT stream…")
+                try:
+                    L.reopen()
+                except Exception:
+                    pass
+                failL = 0
+                last_ok = time.time()
+            if (time.time() - last_ok) > cfg.stall_timeout or failR >= cfg.max_consec_fail:
+                print("[health] reopen RIGHT stream…")
+                try:
+                    R.reopen()
+                except Exception:
+                    pass
+                failR = 0
+                last_ok = time.time()
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user.")
@@ -343,7 +414,8 @@ def run(cfg: AppConfig):
         except Exception:
             pass
         try:
-            L.release(); R.release()
+            L.release()
+            R.release()
         except Exception:
             pass
         if cfg.display:
