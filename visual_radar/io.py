@@ -1,4 +1,3 @@
-# visual_radar/io.py
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -15,10 +14,17 @@ import cv2 as cv
 from visual_radar.utils import now_s
 
 
+def _is_rtsp(url: str) -> bool:
+    try:
+        return url.lower().startswith("rtsp://")
+    except Exception:
+        return False
+
+
 class FFmpegRTSP_MJPEG:
     """
-    Чтение RTSP → транскодирование в MJPEG через ffmpeg → чтение кадров из stdout (image2pipe).
-    API: read() -> (ok, frame, ts), isOpened(), release().
+    RTSP → ffmpeg (TCP) → MJPEG по pipe → cv2.imdecode
+    API: read() -> (ok, frame, ts), isOpened(), release()
     """
 
     def __init__(
@@ -57,43 +63,27 @@ class FFmpegRTSP_MJPEG:
 
         scale = []
         if self.w and self.h:
-            # стабильный размер кадров на выходе (удобно для всего пайплайна)
+            # фиксируем размер на выходе; если не задан — оставляем нативный
             scale = ["-vf", f"scale={self.w}:{self.h}:flags=bicubic"]
 
-        # ВАЖНО: без -stimeout (на Windows часто «Option not found»). Используем -rw_timeout.
         cmd = [
             self.ffmpeg_cmd,
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            "tcp" if self.use_tcp else "udp",
-            "-rtsp_flags",
-            "prefer_tcp",
-            "-rw_timeout",
-            "5000000",  # 5s I/O timeout
-            "-analyzeduration",
-            "10000000",
-            "-probesize",
-            "10000000",
-            "-fflags",
-            "+genpts+igndts",
-            "-flags",
-            "+low_delay",
-            "-use_wallclock_as_timestamps",
-            "1",
-            "-i",
-            self.url,
+            "-hide_banner", "-loglevel", "warning",
+            "-rtsp_transport", "tcp" if self.use_tcp else "udp",
+            "-rtsp_flags", "prefer_tcp",
+            "-rw_timeout", "5000000",          # 5s I/O timeout (кроссплатформенно)
+            "-analyzeduration", "10000000",
+            "-probesize", "10000000",
+            "-fflags", "+genpts+igndts",
+            "-flags", "+low_delay",
+            "-use_wallclock_as_timestamps", "1",
+            "-i", self.url,
             "-an",
             *scale,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-threads",
-            str(self.threads),
-            "-q:v",
-            str(self.q),
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-threads", str(self.threads),
+            "-q:v", str(self.q),
             "-",
         ]
         self.proc = subprocess.Popen(
@@ -180,15 +170,37 @@ class FFmpegRTSP_MJPEG:
 
 
 class RTSPReader:
-    """Простой ридер через OpenCV/FFmpeg без транскодирования."""
+    """
+    OpenCV VideoCapture с FFMPEG backend.
+    - Принудительно включает RTSP/TCP через OPENCV_FFMPEG_CAPTURE_OPTIONS
+    - Для сетевых потоков уменьшает буфер (CAP_PROP_BUFFERSIZE=1)
+    - Не меняет размер по CAP_PROP_FRAME_* для RTSP (смещение/«полосы»)
+    """
+    def _set_default_ffmpeg_opts(self):
+        env = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+        if not env:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "rtsp_transport;tcp|stimeout;3000000|max_delay;500000|buffer_size;1048576"
+            )
+
     def __init__(self, url: str, width: Optional[int], height: Optional[int]):
+        try:
+            self._set_default_ffmpeg_opts()
+        except Exception:
+            pass
         self.cap = cv.VideoCapture(url, cv.CAP_FFMPEG)
-        if width:
-            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, int(width))
-        if height:
-            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, int(height))
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open stream: {url}")
+        # уменьшить внутренний буфер, если это RTSP
+        try:
+            if _is_rtsp(url):
+                self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # Размер не трогаем для RTSP. Для локальных файлов/USB-камер можно.
+        if width and height and not _is_rtsp(url):
+            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, int(width))
+            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, int(height))
 
     def isOpened(self) -> bool:
         return self.cap.isOpened()
@@ -197,6 +209,9 @@ class RTSPReader:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return False, None, None
+        # гарантируем uint8 BGR
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
         return True, frame, now_s()
 
     def release(self) -> None:
@@ -215,26 +230,20 @@ def open_stream(
     mjpeg_q: int = 6,
     ff_threads: int = 3,
 ):
-    """Фабрика источника кадров."""
     if reader == "ffmpeg_mjpeg":
         return FFmpegRTSP_MJPEG(
-            url,
-            width,
-            height,
-            ffmpeg_cmd=ffmpeg,
-            q=mjpeg_q,
-            threads=ff_threads,
+            url, width, height,
+            ffmpeg_cmd=ffmpeg, q=mjpeg_q, threads=ff_threads
         )
     return RTSPReader(url, width, height)
 
 
 def make_writer(path: str, frame_size: Tuple[int, int], fps: float = 20.0):
-    """Создаёт VideoWriter по расширению файла ('.avi' → MJPG, иначе mp4v)."""
-    w, h = frame_size
+    """Создать VideoWriter по расширению ('.avi' → MJPG, иначе MP4V)."""
+    w, h = map(int, frame_size)
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".avi":
-        fourcc = cv.VideoWriter_fourcc(*"MJPG")
-    else:
-        fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    return cv.VideoWriter(path, fourcc, fps, (w, h))
- 
+    fourcc = cv.VideoWriter_fourcc(*("MJPG" if ext == ".avi" else "mp4v"))
+    writer = cv.VideoWriter(path, fourcc, float(fps), (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open VideoWriter: {path}")
+    return writer

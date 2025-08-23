@@ -1,4 +1,3 @@
-# visual_radar/config.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -25,11 +24,11 @@ class SMDParams:
     # --- морфология / ROI / кроп ---
     size_aware_morph: bool = True
     crop_top: int = 0
-    roi_mask: Optional[str] = None  # путь к PNG/JPG маске (белое=вода)
+    roi_mask: Optional[str] = None
 
     # --- персистентность ---
-    persist_k: int = 4     # длина истории масок
-    persist_m: int = 3     # сколько из k нужно для подтверждения
+    persist_k: int = 4
+    persist_m: int = 3
 
     # --- анти-дрейф ---
     drift_max_fg_pct: float = 0.25
@@ -50,7 +49,7 @@ class SMDParams:
     stereo_patch: int = 13
     stereo_ncc_min: float = 0.25
 
-    # --- геометрический «порог парлакса» ---
+    # --- геометрический «порог парракса» ---
     min_disp_pair: float = 2.5
 
     # --- «верх кадра» (небо) ---
@@ -60,7 +59,7 @@ class SMDParams:
     # --- контраст/усиление ---
     use_clahe: bool = True
 
-    # --- SAILS ONLY (фокус на паруса) ---
+    # --- SAILS ONLY ---
     sails_only: bool = False
     sails_water_split: float = 0.55
     sails_white_delta: float = 18.0
@@ -72,22 +71,21 @@ class SMDParams:
 @dataclass
 class AppConfig:
     # --- источники ---
-    left: str = ""        # RTSP/путь (левый)
-    right: str = ""       # RTSP/путь (правый)
+    left: str = ""
+    right: str = ""
     calib_dir: str = "stereo_rtsp_out"
     intrinsics: Optional[str] = None
     baseline: Optional[float] = None
 
+    # Эти размеры будут синхронизированы с фактическими после первого кадра
     width: int = 1280
     height: int = 720
-    native_resolution: bool = False
 
     # --- визуализация / вывод ---
     display: bool = False
-    headless: bool = True
     save_vis: bool = False
 
-    # --- параметры детектора (ВАЖНО: default_factory) ---
+    # --- параметры детектора ---
     smd: SMDParams = field(default_factory=SMDParams)
 
     # --- входной ридер ---
@@ -112,3 +110,7 @@ class AppConfig:
     # --- запись видео ---
     save_path: str = "out.mp4"
     save_fps: float = 15.0
+
+    # --- синхронизация L/R ---
+    sync_max_dt: float = 0.05  # сек
+

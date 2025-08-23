@@ -1,4 +1,3 @@
-# visual_radar/cli.py
 from __future__ import annotations
 
 import time
@@ -17,28 +16,24 @@ from visual_radar.tracks import BoxTracker
 from visual_radar.detector import StereoMotionDetector
 
 
-# -----------------------------
-# CLI parsing
-# -----------------------------
 def build_parser():
     import argparse
-
     p = argparse.ArgumentParser("visual_radar")
 
     # источники
     p.add_argument("--left", required=True, help="RTSP/файл/путь (левый)")
     p.add_argument("--right", required=True, help="RTSP/файл/путь (правый)")
-    p.add_argument("--reader", default="opencv", choices=["opencv", "ffmpeg_mjpeg"], help="способ чтения")
-    p.add_argument("--ffmpeg", default="ffmpeg", help="команда ffmpeg (если нужна)")
-    p.add_argument("--mjpeg_q", type=int, default=6, help="качество MJPEG (ffmpeg_mjpeg)")
-    p.add_argument("--ff_threads", type=int, default=3, help="потоки ffmpeg")
+    p.add_argument("--reader", default="opencv", choices=["opencv", "ffmpeg_mjpeg"])
+    p.add_argument("--ffmpeg", default="ffmpeg")
+    p.add_argument("--mjpeg_q", type=int, default=6)
+    p.add_argument("--ff_threads", type=int, default=3)
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
 
-    # калибровка/ремап
+    # калибровка
     p.add_argument("--calib_dir", type=str, default="stereo_rtsp_out")
-    p.add_argument("--intrinsics", type=str, default=None, help="путь к intrinsics.npz (опционально)")
-    p.add_argument("--baseline", type=float, default=None, help="база камер в метрах (опционально) — для совместимости")
+    p.add_argument("--intrinsics", type=str, default=None)
+    p.add_argument("--baseline", type=float, default=None)
 
     # вывод
     p.add_argument("--display", action="store_true")
@@ -75,16 +70,16 @@ def build_parser():
     p.add_argument("--drift_max_fg_pct", type=float, default=0.25)
     p.add_argument("--drift_max_frames", type=int, default=60)
 
-    # трекер (анти-мерцание + движение)
+    # трекер
     p.add_argument("--min_track_age", type=int, default=3)
     p.add_argument("--max_missed", type=int, default=3)
     p.add_argument("--iou_match_thr", type=float, default=0.3)
-    p.add_argument("--min_track_disp", type=float, default=6.0, help="суммарное смещение (px) за окно")
-    p.add_argument("--min_track_speed", type=float, default=1.2, help="средняя скорость (px/кадр) за окно")
+    p.add_argument("--min_track_disp", type=float, default=6.0)
+    p.add_argument("--min_track_speed", type=float, default=1.2)
 
-    # stereo / эпиполярка
-    p.add_argument("--min_disp_pair", type=float, default=2.5, help="минимальная |диспаритет| по центрам боксов")
-    p.add_argument("--y_area_split", type=float, default=0.55, help="граница неба/воды по высоте (0..1)")
+    # stereo / верх кадра
+    p.add_argument("--min_disp_pair", type=float, default=2.5)
+    p.add_argument("--y_area_split", type=float, default=0.55)
 
     # снапшоты
     p.add_argument("--snapshots", action="store_true")
@@ -95,20 +90,14 @@ def build_parser():
     p.add_argument("--snap_cooldown", type=float, default=1.5)
     p.add_argument("--snap_debug", action="store_true")
 
-    # SAILS ONLY
-    p.add_argument("--sails_only", action="store_true", help="Фильтр под паруса (если нет ROI воды).")
-    p.add_argument("--sails_water_split", type=float, default=0.55)
-    p.add_argument("--sails_white_delta", type=float, default=18.0)
-    p.add_argument("--sails_min_h_over_w", type=float, default=0.85)
-    p.add_argument("--sails_max_w", type=int, default=240)
-    p.add_argument("--sails_min_h", type=int, default=6)
+    # синхронизация
+    p.add_argument("--sync_max_dt", type=float, default=0.05)
 
     return p
 
 
 def args_to_config(args) -> AppConfig:
     smd = SMDParams(
-        # день/ночь
         night_auto=bool(args.night_auto),
         night_luma_thr=float(args.night_luma_thr),
         min_area=int(args.min_area),
@@ -116,89 +105,41 @@ def args_to_config(args) -> AppConfig:
         min_area_night_mult=float(args.min_area_night_mult),
         morph_open_day=int(args.morph_open_day),
         morph_open_night=int(args.morph_open_night),
-
-        # движение/шум
         thr_fast=float(args.noise_k_fast),
         thr_slow=float(args.noise_k_slow),
-
-        # морфология/маски
         crop_top=int(args.crop_top),
         roi_mask=args.roi_mask,
-
-        # персистентность
         persist_k=int(args.persist_k),
         persist_m=int(args.persist_m),
-
-        # анти-дрейф
         drift_max_fg_pct=float(args.drift_max_fg_pct),
         drift_max_frames=int(args.drift_max_frames),
-
-        # трекер
         track_iou_thr=float(args.iou_match_thr),
         track_min_age=int(args.min_track_age),
         track_max_missed=int(args.max_missed),
         track_min_disp=float(args.min_track_disp),
         track_min_speed=float(args.min_track_speed),
-
-        # stereo / верх кадра
         min_disp_pair=float(args.min_disp_pair),
         y_area_split=float(args.y_area_split),
-
-        # sails-only
-        sails_only=bool(args.sails_only),
-        sails_water_split=float(args.sails_water_split),
-        sails_white_delta=float(args.sails_white_delta),
-        sails_min_h_over_w=float(args.sails_min_h_over_w),
-        sails_max_w=int(args.sails_max_w),
-        sails_min_h=int(args.sails_min_h),
+        sails_only=False,
     )
 
     return AppConfig(
-        left=args.left,
-        right=args.right,
-        calib_dir=args.calib_dir,
-        intrinsics=args.intrinsics,
-        baseline=args.baseline,
-        width=args.width,
-        height=args.height,
-        native_resolution=False,
-
-        display=bool(args.display),
-        headless=not bool(args.display),
-        save_vis=bool(args.save_vis),
-
+        left=args.left, right=args.right,
+        calib_dir=args.calib_dir, intrinsics=args.intrinsics, baseline=args.baseline,
+        width=int(args.width), height=int(args.height),
+        display=bool(args.display), save_vis=bool(args.save_vis),
         smd=smd,
-
-        # reader
-        reader=args.reader,
-        ffmpeg=args.ffmpeg,
-        mjpeg_q=int(args.mjpeg_q),
-        ff_threads=int(args.ff_threads),
-
-        # вывод
-        display_max_w=int(args.display_max_w),
-        display_max_h=int(args.display_max_h),
-
-        # снапшоты
-        snapshots=bool(args.snapshots),
-        snap_dir=args.snap_dir,
-        snap_min_cc=float(args.snap_min_cc),
-        snap_min_disp=float(args.snap_min_disp),
-        snap_pad=int(args.snap_pad),
-        snap_cooldown=float(args.snap_cooldown),
-        snap_debug=bool(args.snap_debug),
-
-        # запись
-        save_path=args.save_path,
-        save_fps=float(args.save_fps),
+        reader=args.reader, ffmpeg=args.ffmpeg, mjpeg_q=int(args.mjpeg_q), ff_threads=int(args.ff_threads),
+        display_max_w=int(args.display_max_w), display_max_h=int(args.display_max_h),
+        snapshots=bool(args.snapshots), snap_dir=args.snap_dir,
+        snap_min_cc=float(args.snap_min_cc), snap_min_disp=float(args.snap_min_disp),
+        snap_pad=int(args.snap_pad), snap_cooldown=float(args.snap_cooldown), snap_debug=bool(args.snap_debug),
+        save_path=args.save_path, save_fps=float(args.save_fps),
+        sync_max_dt=float(args.sync_max_dt),
     )
 
 
-# -----------------------------
-# helpers
-# -----------------------------
 def warmup(reader, name: str, timeout_s: float = 20.0):
-    """Ждём первый кадр от источника до timeout_s секунд (по умолчанию 20с)."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         ok, fr, ts = reader.read()
@@ -208,45 +149,42 @@ def warmup(reader, name: str, timeout_s: float = 20.0):
     return False, None, None
 
 
-# -----------------------------
-# main run loop
-# -----------------------------
 def run(cfg: AppConfig):
-    # открыть источники
-    L = open_stream(cfg.left, cfg.width, cfg.height,
-                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
+    L = open_stream(cfg.left, cfg.width, cfg.height, reader=cfg.reader, ffmpeg=cfg.ffmpeg,
                     mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
-    R = open_stream(cfg.right, cfg.width, cfg.height,
-                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
+    R = open_stream(cfg.right, cfg.width, cfg.height, reader=cfg.reader, ffmpeg=cfg.ffmpeg,
                     mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
 
-    # тёплый старт 20с
     okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
     okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
 
-    # авто-фоллбэк: если MJPEG не дал кадр — пробуем OpenCV/H.264
     if (not okL or not okR) and cfg.reader == "ffmpeg_mjpeg":
-        print("[warmup] no frames via ffmpeg_mjpeg → fallback to opencv reader...")
-        try:
-            L.release(); R.release()
-        except Exception:
-            pass
-        L = open_stream(cfg.left, cfg.width, cfg.height, reader="opencv",
-                        ffmpeg=cfg.ffmpeg, mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
-        R = open_stream(cfg.right, cfg.width, cfg.height, reader="opencv",
-                        ffmpeg=cfg.ffmpeg, mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
+        print("[warmup] no frames via ffmpeg_mjpeg → fallback to opencv")
+        try: L.release(); R.release()
+        except Exception: pass
+        L = open_stream(cfg.left, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
+                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
+        R = open_stream(cfg.right, cfg.width, cfg.height, reader="opencv", ffmpeg=cfg.ffmpeg,
+                        mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads)
         okL, fL0, _ = warmup(L, "LEFT", timeout_s=20.0)
         okR, fR0, _ = warmup(R, "RIGHT", timeout_s=20.0)
 
     if not okL or not okR:
         print("[warmup] no frames within 20s. stop.")
-        try:
-            L.release(); R.release()
-        except Exception:
-            pass
+        try: L.release(); R.release()
+        except Exception: pass
         return
 
-    # калибровка/ректификация
+    # --- Синхронизируем cfg.width/height с реальными из кадра (док. OpenCV: не полагаться на set/get для сетевых источников)
+    h0, w0 = fL0.shape[:2]
+    if (cfg.width, cfg.height) != (w0, h0):
+        cfg.width, cfg.height = w0, h0
+
+    # подготовка окна (если показываем)
+    if cfg.display:
+        cv.namedWindow("VisualRadar L|R", cv.WINDOW_NORMAL)
+
+    # калибровка/ремап под фактический размер
     calib = load_calibration(
         Path(cfg.calib_dir),
         Path(cfg.intrinsics) if cfg.intrinsics else None,
@@ -254,7 +192,6 @@ def run(cfg: AppConfig):
         cfg.baseline,
     )
 
-    # детектор и трекеры
     frame_size: Tuple[int, int] = (cfg.width, cfg.height)
     det = StereoMotionDetector(frame_size, cfg.smd)
 
@@ -273,7 +210,6 @@ def run(cfg: AppConfig):
         min_speed=float(cfg.smd.track_min_speed),
     )
 
-    # снапшоты (опционально)
     saver: Optional[SnapshotSaver] = None
     if cfg.snapshots:
         saver = SnapshotSaver(
@@ -285,14 +221,10 @@ def run(cfg: AppConfig):
             debug=cfg.snap_debug,
         )
 
-    # запись (опционально)
     writer = None
-    if cfg.save_vis:
-        sp = Path(cfg.save_path)
-        writer = make_writer(str(sp), (cfg.width * 2, cfg.height), fps=cfg.save_fps)
+    sp = Path(cfg.save_path) if cfg.save_vis else None
 
     print("[*] Running.  Press ESC to stop.")
-
     try:
         while True:
             okL, fL, tL = L.read()
@@ -300,29 +232,26 @@ def run(cfg: AppConfig):
             if not okL or not okR:
                 continue
 
-            # ректификация
+            # гейт по рассинхрону меток времени
+            if abs(float(tL) - float(tR)) > float(cfg.sync_max_dt):
+                continue
+
             rL, rR = rectified_pair(calib, fL, fR)
 
-            # детекция
             mL, mR, boxesL, boxesR, pairs = det.step(rL, rR)
 
-            # --- Stereo parallax gate: минимальный диспаритет по центрам
+            # стерео-фильтр по минимальному диспаритету
             if pairs:
                 disp_thr = float(cfg.smd.min_disp_pair)
-                new_pairs = []
-                keepL_idx = set()
-                keepR_idx = set()
+                new_pairs, keepL_idx, keepR_idx = [], set(), set()
                 for (i, j) in pairs:
                     if i < len(boxesL) and j < len(boxesR):
                         disp = float(boxesL[i].cx - boxesR[j].cx)
                         if abs(disp) >= disp_thr:
                             new_pairs.append((i, j))
-                            keepL_idx.add(i)
-                            keepR_idx.add(j)
-
+                            keepL_idx.add(i); keepR_idx.add(j)
                 if new_pairs:
-                    idxL = sorted(keepL_idx)
-                    idxR = sorted(keepR_idx)
+                    idxL = sorted(keepL_idx); idxR = sorted(keepR_idx)
                     mapL = {old: k for k, old in enumerate(idxL)}
                     mapR = {old: k for k, old in enumerate(idxR)}
                     boxesL = [boxesL[k] for k in idxL]
@@ -331,37 +260,25 @@ def run(cfg: AppConfig):
                 else:
                     boxesL, boxesR, pairs = [], [], []
 
-            # --- трекер
             keepL: Set[int] = trL.update(boxesL)
             keepR: Set[int] = trR.update(boxesR)
+            boxesL = [b for i, b in enumerate(boxesL) if i in keepL]
+            boxesR = [b for i, b in enumerate(boxesR) if i in keepR]
 
-            # применяем фильтр к спискам боксов
-            def _filter_boxes(boxes, keep: Set[int]):
-                return [b for i, b in enumerate(boxes) if i in keep]
-
-            boxesL = _filter_boxes(boxesL, keepL)
-            boxesR = _filter_boxes(boxesR, keepR)
-
-            # перестроить пары под отфильтрованные
             if pairs:
-                # создадим индекс-переотображение
                 idxL = {i: k for k, i in enumerate(sorted(keepL))}
                 idxR = {j: k for k, j in enumerate(sorted(keepR))}
-                new_pairs = []
-                for (i, j) in pairs:
-                    if i in idxL and j in idxR:
-                        new_pairs.append((idxL[i], idxR[j]))
-                pairs = new_pairs
+                pairs = [(idxL[i], idxR[j]) for (i, j) in pairs if i in idxL and j in idxR]
 
-            # визуализация
-            visL = rL.copy()
-            visR = rR.copy()
+            visL = rL.copy(); visR = rR.copy()
             draw_boxes(visL, boxesL, (0, 255, 0), "L")
             draw_boxes(visR, boxesR, (255, 0, 0), "R")
             vis = stack_lr(visL, visR)
 
-            # запись/показ
-            if writer is not None:
+            if cfg.save_vis:
+                if writer is None:
+                    h, w = vis.shape[:2]
+                    writer = make_writer(str(sp), (w, h), fps=cfg.save_fps)
                 writer.write(vis)
 
             if cfg.display:
@@ -369,22 +286,18 @@ def run(cfg: AppConfig):
                 if (cv.waitKey(1) & 0xFF) == 27:
                     break
 
-            # снапшоты
             if saver is not None and pairs:
                 Q = getattr(calib, "Q", None) if hasattr(calib, "Q") else None
                 for (i, j) in pairs:
                     if i >= len(boxesL) or j >= len(boxesR):
                         continue
-                    bl = boxesL[i]
-                    br = boxesR[j]
+                    bl, br = boxesL[i], boxesR[j]
                     disp = float(bl.cx - br.cx)
                     saver.maybe_save(
-                        rL,
-                        rR,
+                        rL, rR,
                         (int(bl.x), int(bl.y), int(bl.w), int(bl.h)),
                         (int(br.x), int(br.y), int(br.w), int(br.h)),
-                        disp,
-                        Q=Q,
+                        disp, Q=Q,
                     )
 
     except KeyboardInterrupt:
@@ -396,8 +309,7 @@ def run(cfg: AppConfig):
         except Exception:
             pass
         try:
-            L.release()
-            R.release()
+            L.release(); R.release()
         except Exception:
             pass
         if cfg.display:
