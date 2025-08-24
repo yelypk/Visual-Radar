@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import os
 import shutil
 import subprocess
@@ -15,6 +15,9 @@ from visual_radar.utils import now_s
 
 
 def _is_rtsp(url: str) -> bool:
+    """
+    Check if the URL is an RTSP stream.
+    """
     try:
         return url.lower().startswith("rtsp://")
     except Exception:
@@ -23,7 +26,7 @@ def _is_rtsp(url: str) -> bool:
 
 class FFmpegRTSP_MJPEG:
     """
-    RTSP → ffmpeg (TCP) → MJPEG по pipe → cv2.imdecode
+    RTSP → ffmpeg (TCP) → MJPEG via pipe → cv2.imdecode
     API: read() -> (ok, frame, ts), isOpened(), reopen(), release()
     """
 
@@ -55,9 +58,10 @@ class FFmpegRTSP_MJPEG:
 
         self._start()
 
-    # ---------- low-level ----------
-
     def _start(self) -> None:
+        """
+        Start the ffmpeg process and reader thread.
+        """
         if not (shutil.which(self.ffmpeg_cmd) or os.path.exists(self.ffmpeg_cmd)):
             raise RuntimeError(f"ffmpeg not found: {self.ffmpeg_cmd}")
 
@@ -70,7 +74,7 @@ class FFmpegRTSP_MJPEG:
             "-hide_banner", "-loglevel", "warning",
             "-rtsp_transport", "tcp" if self.use_tcp else "udp",
             "-rtsp_flags", "prefer_tcp",
-            "-rw_timeout", "5000000",          # 5s I/O timeout кроссплатформенно
+            "-rw_timeout", "5000000",          # 5s I/O timeout cross-platform
             "-analyzeduration", "10000000",
             "-probesize", "10000000",
             "-fflags", "+genpts+igndts",
@@ -97,6 +101,9 @@ class FFmpegRTSP_MJPEG:
         self._thr.start()
 
     def _reader(self) -> None:
+        """
+        Read MJPEG frames from ffmpeg stdout and push complete JPEGs to the queue.
+        """
         CHUNK = 65536
         SOI, EOI = b"\xff\xd8", b"\xff\xd9"  # JPEG markers
         while not self._stop.is_set() and self.proc and self.proc.poll() is None:
@@ -106,7 +113,7 @@ class FFmpegRTSP_MJPEG:
                     time.sleep(0.01)
                     continue
                 self.buf += data
-                # вырезаем целые JPEG из буфера
+                # Extract complete JPEGs from buffer
                 while True:
                     i = self.buf.find(SOI)
                     if i == -1:
@@ -128,13 +135,16 @@ class FFmpegRTSP_MJPEG:
                 time.sleep(0.01)
                 continue
 
-    # ---------- public API ----------
-
     def isOpened(self) -> bool:
+        """
+        Check if the ffmpeg process is running.
+        """
         return self.proc is not None and self.proc.poll() is None
 
-    def read(self):
-        # авто-репуск ffmpeg, если процесс умер
+    def read(self) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
+        """
+        Read a frame from the MJPEG stream.
+        """
         if self.proc is None or self.proc.poll() is not None:
             self.reopen()
             time.sleep(0.1)
@@ -148,10 +158,16 @@ class FFmpegRTSP_MJPEG:
         return True, img, now_s()
 
     def reopen(self) -> None:
+        """
+        Restart the ffmpeg process and reader thread.
+        """
         self.release()
         self._start()
 
     def release(self) -> None:
+        """
+        Stop the reader thread and kill the ffmpeg process.
+        """
         try:
             self._stop.set()
             if self._thr and self._thr.is_alive():
@@ -173,19 +189,16 @@ class FFmpegRTSP_MJPEG:
 
 class RTSPReader:
     """
-    OpenCV VideoCapture с FFMPEG backend.
-    - RTSP/TCP и таймауты через OPENCV_FFMPEG_CAPTURE_OPTIONS
-    - CAP_PROP_BUFFERSIZE для низкой задержки (сетевые потоки)
-    - CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC (если доступны)
-    - CAP_PROP_CONVERT_RGB=1
-    - Для RTSP не меняем CAP_PROP_FRAME_* (иначе полосы/смещения)
+    OpenCV VideoCapture with FFMPEG backend.
     API: read() -> (ok, frame, ts), reopen(), release()
     """
 
     def _set_default_ffmpeg_opts(self):
+        """
+        Set default FFMPEG options for RTSP streams.
+        """
         env = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         if not env:
-            # единый формат key;val|key;val (docs)
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
                 "rtsp_transport;tcp|stimeout;5000000|max_delay;500000|buffer_size;1048576"
             )
@@ -198,6 +211,9 @@ class RTSPReader:
         self._open()
 
     def _open(self):
+        """
+        Open the video stream.
+        """
         try:
             self._set_default_ffmpeg_opts()
         except Exception:
@@ -207,13 +223,13 @@ class RTSPReader:
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open stream: {self.url}")
 
-        # уменьшить внутренний буфер, если это RTSP
+        # Reduce internal buffer for RTSP
         if _is_rtsp(self.url):
             try:
                 self.cap.set(cv.CAP_PROP_BUFFERSIZE, self.cap_buffersize)
             except Exception:
                 pass
-            # новые пропсы таймаутов (если присутствуют в твоей сборке OpenCV)
+            # Set new timeout properties if available
             for prop, val in [(getattr(cv, "CAP_PROP_OPEN_TIMEOUT_MSEC", None), 4000),
                               (getattr(cv, "CAP_PROP_READ_TIMEOUT_MSEC", None), 4000)]:
                 if prop is not None:
@@ -222,21 +238,27 @@ class RTSPReader:
                     except Exception:
                         pass
 
-        # гарантируем BGR uint8
+        # Ensure BGR uint8
         try:
             self.cap.set(cv.CAP_PROP_CONVERT_RGB, 1)
         except Exception:
             pass
 
-        # Размер не трогаем для RTSP. Для локальных файлов/USB-камер можно.
+        # Set frame size for local files/USB cameras
         if self.w and self.h and not _is_rtsp(self.url):
             self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.w)
             self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.h)
 
     def isOpened(self) -> bool:
+        """
+        Check if the stream is open.
+        """
         return self.cap.isOpened()
 
-    def read(self):
+    def read(self) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
+        """
+        Read a frame from the stream.
+        """
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return False, None, None
@@ -245,6 +267,9 @@ class RTSPReader:
         return True, frame, now_s()
 
     def reopen(self) -> None:
+        """
+        Reopen the video stream.
+        """
         try:
             self.cap.release()
         except Exception:
@@ -252,6 +277,9 @@ class RTSPReader:
         self._open()
 
     def release(self) -> None:
+        """
+        Release the video stream.
+        """
         try:
             self.cap.release()
         except Exception:
@@ -266,8 +294,11 @@ def open_stream(
     ffmpeg: str = "ffmpeg",
     mjpeg_q: int = 6,
     ff_threads: int = 3,
-    cap_buffersize: int | None = None,
+    cap_buffersize: Optional[int] = None,
 ):
+    """
+    Open a video stream using the specified backend.
+    """
     if reader == "ffmpeg_mjpeg":
         return FFmpegRTSP_MJPEG(
             url, width, height,
@@ -277,7 +308,9 @@ def open_stream(
 
 
 def make_writer(path: str, frame_size: Tuple[int, int], fps: float = 20.0):
-    """Создать VideoWriter по расширению ('.avi' → MJPG, иначе MP4V)."""
+    """
+    Create a VideoWriter based on file extension ('.avi' → MJPG, otherwise MP4V).
+    """
     w, h = map(int, frame_size)
     ext = os.path.splitext(path)[1].lower()
     fourcc = cv.VideoWriter_fourcc(*("MJPG" if ext == ".avi" else "mp4v"))
@@ -285,4 +318,3 @@ def make_writer(path: str, frame_size: Tuple[int, int], fps: float = 20.0):
     if not writer.isOpened():
         raise RuntimeError(f"Cannot open VideoWriter: {path}")
     return writer
-

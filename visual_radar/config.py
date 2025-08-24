@@ -62,8 +62,8 @@ class AppConfig:
     left: str = ""
     right: str = ""
     calib_dir: str = "stereo_rtsp_out"
-    intrinsics: Optional[str] = None
-    baseline: Optional[float] = None
+    intrinsics: Optional[str] = field(default=None)
+    baseline: Optional[float] = field(default=None)
 
     width: int = 1280
     height: int = 720

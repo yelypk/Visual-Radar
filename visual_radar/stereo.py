@@ -6,7 +6,6 @@ import cv2 as cv
 
 from visual_radar.utils import BBox
 
-
 def gate_pairs_rectified(
     boxesL: List[BBox],
     boxesR: List[BBox],
@@ -17,14 +16,14 @@ def gate_pairs_rectified(
     w_d: float = 0.25,
 ) -> List[Tuple[int, int]]:
     """
-    Жадное сопоставление L/R-боксов на РЕКТИФИЦИРОВАННЫХ кадрах.
-    Условие кандидата: |cyL - cyR| <= y_eps и disparity d = (cxL - cxR) в [dmin, dmax].
-    Выбираем пары, минимизируя комбинированный скор: w_y*|Δy| + w_d*|d|.
+    Greedy matching of L/R boxes on rectified frames.
+    Candidate condition: |cyL - cyR| <= y_eps and disparity d = (cxL - cxR) in [dmin, dmax].
+    Pairs are selected to minimize combined score: w_y*|Δy| + w_d*|d|.
     """
     if not boxesL or not boxesR:
         return []
 
-    cands: List[Tuple[int, int, float]] = []
+    candidates: List[Tuple[int, int, float]] = []
     for i, bl in enumerate(boxesL):
         for j, br in enumerate(boxesR):
             dy = float(abs(bl.cy - br.cy))
@@ -34,23 +33,25 @@ def gate_pairs_rectified(
             if d < float(dmin) or d > float(dmax):
                 continue
             score = float(w_y) * dy + float(w_d) * abs(d)
-            cands.append((i, j, score))
+            candidates.append((i, j, score))
 
-    if not cands:
+    if not candidates:
         return []
 
-    cands.sort(key=lambda t: t[2])  # чем меньше скор, тем лучше
+    candidates.sort(key=lambda t: t[2])  # Lower score is better
     usedL, usedR, pairs = set(), set(), []
-    for i, j, _ in cands:
+    for i, j, _ in candidates:
         if i in usedL or j in usedR:
             continue
-        usedL.add(i); usedR.add(j)
+        usedL.add(i)
+        usedR.add(j)
         pairs.append((i, j))
     return pairs
 
-
 def _crop_patch(img: np.ndarray, cx: float, cy: float, half: int) -> Optional[np.ndarray]:
-    """Вырезать квадратный патч с центром (cx, cy) и половинкой размера half."""
+    """
+    Crop a square patch centered at (cx, cy) with half-size 'half'.
+    """
     h, w = img.shape[:2]
     x1 = int(round(cx)) - half
     y1 = int(round(cy)) - half
@@ -58,29 +59,33 @@ def _crop_patch(img: np.ndarray, cx: float, cy: float, half: int) -> Optional[np
     y2 = y1 + 2 * half + 1
     if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
         return None
-    x1 = max(0, x1); y1 = max(0, y1)
-    x2 = min(w, x2); y2 = min(h, y2)
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
     if x2 - x1 < 2 or y2 - y1 < 2:
         return None
     return img[y1:y2, x1:x2]
 
-
 def _to_gray(img: np.ndarray) -> np.ndarray:
+    """
+    Convert image to grayscale if needed.
+    """
     return img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
-
 def _grad_img(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
-    """Модуль градиента (Sobel) → float32, для более устойчивого NCC."""
+    """
+    Gradient magnitude (Sobel) as float32, for more robust NCC.
+    """
     gx = cv.Sobel(gray, cv.CV_32F, 1, 0, ksize=ksize)
     gy = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=ksize)
-    mag = cv.magnitude(gx, gy)  # float32
+    mag = cv.magnitude(gx, gy)
     return mag
-
 
 def _parabolic_subpixel_1d(vals: np.ndarray) -> float:
     """
-    Субпиксельная поправка по трём точкам (l, c, r).
-    Возвращает dx в [-0.5, 0.5] относительно центра.
+    Subpixel correction using three points (l, c, r).
+    Returns dx in [-0.5, 0.5] relative to center.
     """
     if vals.shape[0] != 3:
         return 0.0
@@ -88,8 +93,7 @@ def _parabolic_subpixel_1d(vals: np.ndarray) -> float:
     denom = (l - 2.0 * c + r)
     if abs(denom) < 1e-12:
         return 0.0
-    return 0.5 * (l - r) / denom  # стандартная формула для параболы
-
+    return 0.5 * (l - r) / denom
 
 def epipolar_ncc_match(
     grayL: np.ndarray,
@@ -103,20 +107,19 @@ def epipolar_ncc_match(
     subpixel: bool = True,
 ) -> Optional[BBox]:
     """
-    Поиск соответствия для левого бокса вдоль эпиполярной строки (горизонтали) в правом кадре
-    с помощью NCC (cv.matchTemplate, TM_CCOEFF_NORMED), опционально по градиенту.
-    Возвращает правый BBox (того же размера, что и левый), либо None при неудаче.
+    Find correspondence for the left box along the epipolar line (horizontal) in the right frame
+    using NCC (cv.matchTemplate, TM_CCOEFF_NORMED), optionally using gradient.
+    Returns right BBox (same size as left), or None if not found.
     """
     gL = _to_gray(grayL)
     gR = _to_gray(grayR)
 
-    # по градиенту — устойчивее к изменениям яркости
+    # Use gradient for robustness to brightness changes
     if use_gradient:
         gL32 = _grad_img(gL, ksize=int(grad_ksize))
         gR32 = _grad_img(gR, ksize=int(grad_ksize))
         srcL, srcR = gL32, gR32
     else:
-        # matchTemplate ок c 8U/32F → перейдём на 32F
         srcL = gL.astype(np.float32)
         srcR = gR.astype(np.float32)
 
@@ -125,7 +128,7 @@ def epipolar_ncc_match(
     if tpl is None:
         return None
 
-    # фильтр малотекстурных патчей (иначе NCC сильно шумит)
+    # Filter low-texture patches (NCC is noisy otherwise)
     if float(np.var(tpl)) < 5.0:
         return None
 
@@ -150,7 +153,7 @@ def epipolar_ncc_match(
     if float(max_val) < float(ncc_min):
         return None
 
-    # субпиксельная подстройка по X
+    # Subpixel adjustment in X
     dx_sub = 0.0
     if subpixel and res.shape[1] >= 3:
         cx = max_loc[0]
@@ -158,12 +161,14 @@ def epipolar_ncc_match(
             triplet = res[max_loc[1], cx - 1 : cx + 2].astype(np.float32)
             dx_sub = float(np.clip(_parabolic_subpixel_1d(triplet), -0.5, 0.5))
 
-    # координаты в правом кадре
+    # Coordinates in right frame
     top_left = (x1 + max_loc[0], y1 + max_loc[1])
     cxR = top_left[0] + tpl.shape[1] * 0.5 + dx_sub
     cyR = top_left[1] + tpl.shape[0] * 0.5
 
-    return BBox(float(cxR - boxL.w * 0.5),
-                float(cyR - boxL.h * 0.5),
-                float(boxL.w),
-                float(boxL.h))
+    return BBox(
+        float(cxR - boxL.w * 0.5),
+        float(cyR - boxL.h * 0.5),
+        float(boxL.w),
+        float(boxL.h),
+    )

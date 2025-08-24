@@ -18,9 +18,10 @@ from visual_radar.utils import BBox
 
 
 def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
-    """Лёгкое шумоподавление ночью (поддерживаем чётные/нечётные ядра согласно докам)."""
+    """
+    Light denoising at night (supports even/odd kernels as per OpenCV docs).
+    """
     if night:
-        # non-local means затем мягкий Gaussian
         try:
             gray = cv.fastNlMeansDenoising(gray, None, 7, 7, 21)
         except Exception:
@@ -30,7 +31,9 @@ def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
 
 
 def _boxes_from_mask(mask: np.ndarray, min_area: int, max_area: int) -> List[BBox]:
-    """BBox(x,y,w,h, area, cx, cy) из бинарной маски по контурам."""
+    """
+    Extract bounding boxes from a binary mask using contours.
+    """
     boxes: List[BBox] = []
     if mask is None or mask.size == 0:
         return boxes
@@ -54,7 +57,9 @@ def _shape_gate_sky(
     max_sky_w: int = 240,
     min_h: int = 3,
 ) -> List[BBox]:
-    """Фильтр «формы» только для НЕБА: отбрасываем длинные горизонтальные ленты облаков."""
+    """
+    Shape filter for sky region: removes long horizontal cloud stripes.
+    """
     out: List[BBox] = []
     thr_y = split * float(h)
     for b in boxes:
@@ -76,10 +81,10 @@ def _sails_only_gate(
     min_h: int = 6,
 ) -> List[BBox]:
     """
-    Оставляем кандидатов на ПАРУСА:
-    - центроид НИЖЕ water_y (вода),
-    - «высокий» бокс: h/w >= min_h_over_w, h >= min_h, w <= max_w,
-    - белее воды: mean(gray_box) > median(gray_water_band) + white_delta.
+    Keep only candidate sail boxes:
+    - Centroid below water_y (water region)
+    - Tall box: h/w >= min_h_over_w, h >= min_h, w <= max_w
+    - Brighter than water: mean(gray_box) > median(gray_water_band) + white_delta
     """
     h, w = gray.shape[:2]
     y1 = max(water_y - 40, 0)
@@ -111,26 +116,29 @@ def _sails_only_gate(
 
 
 class StereoMotionDetector:
+    """
+    Stereo motion detector for rectified image pairs.
+    """
     def __init__(self, frame_size: Tuple[int, int], params: SMDParams):
         self.params = params
         w, h = frame_size
         self._frame_size = (w, h)
 
-        # фоновые модели
+        # Background models
         self.bgL = DualBGModel((h, w))
         self.bgR = DualBGModel((h, w))
 
-        # персистентность
+        # Persistence
         self.persist_k = int(getattr(self.params, "persist_k", 4))
         self.persist_m = int(getattr(self.params, "persist_m", 3))
         self.histL = deque(maxlen=self.persist_k)
         self.histR = deque(maxlen=self.persist_k)
 
-        # анти-дрейф
+        # Anti-drift
         self._drift_streak = 0
         self.is_night = False
 
-        # ROI (если задана)
+        # ROI mask (if provided)
         self.roi: Optional[np.ndarray] = None
         roi_path = getattr(self.params, "roi_mask", None)
         if roi_path:
@@ -144,6 +152,9 @@ class StereoMotionDetector:
                 self.roi = None
 
     def _reset_background(self):
+        """
+        Reset background models and persistence history.
+        """
         w, h = self._frame_size
         try:
             self.bgL = DualBGModel((h, w))
@@ -154,10 +165,13 @@ class StereoMotionDetector:
         self.histR = deque(maxlen=self.persist_k)
 
     def step(self, rectL_bgr: np.ndarray, rectR_bgr: np.ndarray):
+        """
+        Process a pair of rectified BGR frames and return masks, boxes, and stereo pairs.
+        """
         gL = as_gray(rectL_bgr)
         gR = as_gray(rectR_bgr)
 
-        # день/ночь
+        # Night/day detection
         night_auto = bool(getattr(self.params, "night_auto", True))
         night_thr = float(getattr(self.params, "night_luma_thr", 50.0))
         self.is_night = (float(np.mean(gL)) < night_thr) if night_auto else False
@@ -167,9 +181,9 @@ class StereoMotionDetector:
 
         use_clahe = bool(getattr(self.params, "use_clahe", True))
         if self.is_night:
-            use_clahe = False  # ночью лучше без CLAHE → меньше фантомов
+            use_clahe = False  # CLAHE at night increases false positives
 
-        # базовые маски движения
+        # Basic motion masks
         mL, _ = find_motion_bboxes(
             gL, self.bgL,
             int(getattr(self.params, "min_area", 25)),
@@ -189,7 +203,7 @@ class StereoMotionDetector:
             size_aware_morph=bool(getattr(self.params, "size_aware_morph", True)),
         )
 
-        # подавляем «медленный» дрейф облаков В НЕБЕ
+        # Suppress slow cloud drift in the sky
         try:
             mL_static, mL_slow = make_masks_static_and_slow(
                 gL, self.bgL,
@@ -206,7 +220,8 @@ class StereoMotionDetector:
             h2, _ = gL.shape[:2]
             split = float(getattr(self.params, "y_area_split", 0.55))
             sky_y = int(split * h2)
-            sky_mask = np.zeros_like(mL, dtype=np.uint8); sky_mask[:sky_y, :] = 255
+            sky_mask = np.zeros_like(mL, dtype=np.uint8)
+            sky_mask[:sky_y, :] = 255
             not_sky = cv.bitwise_not(sky_mask)
 
             mL = cv.bitwise_or(cv.bitwise_and(mL, not_sky), cv.bitwise_and(mL_slow, sky_mask))
@@ -214,13 +229,13 @@ class StereoMotionDetector:
         except Exception:
             pass
 
-        # подрезка сверху (если нужно)
+        # Crop top if needed
         crop_top = int(getattr(self.params, "crop_top", 0))
         if crop_top > 0:
             mL[:crop_top, :] = 0
             mR[:crop_top, :] = 0
 
-        # --- ROI: один блок, бинаризация + автоподгон под текущий размер масок ---
+        # ROI mask block
         if self.roi is not None:
             if self.roi.ndim == 3:
                 self.roi = cv.cvtColor(self.roi, cv.COLOR_BGR2GRAY)
@@ -231,16 +246,15 @@ class StereoMotionDetector:
                 self.roi = (self.roi > 0).astype(np.uint8) * 255
             mL = cv.bitwise_and(mL, self.roi)
             mR = cv.bitwise_and(mR, self.roi)
-        # --------------------------------------------------------------------------
 
-        # ночная коррекция min_area
+        # Night correction for min_area
         min_area = int(getattr(self.params, "min_area", 25))
         if self.is_night:
             mult = float(getattr(self.params, "min_area_night_mult", 4.0))
             min_area = int(min_area * mult)
         max_area = int(getattr(self.params, "max_area", 0))
 
-        # подчистка по компонентам
+        # Clean up by connected components
         def _cc_clean(mm: np.ndarray) -> np.ndarray:
             if mm is None or mm.size == 0:
                 return mm
@@ -255,7 +269,7 @@ class StereoMotionDetector:
         mL_clean = _cc_clean(mL)
         mR_clean = _cc_clean(mR)
 
-        # персистентность
+        # Persistence mask
         def _persist_mask(hist, cur, need):
             S = np.zeros_like(cur, dtype=np.uint16)
             for x in hist:
@@ -270,7 +284,7 @@ class StereoMotionDetector:
         mL_final = _persist_mask(self.histL, mL_clean, self.persist_m)
         mR_final = _persist_mask(self.histR, mR_clean, self.persist_m)
 
-        # анти-дрейф (перезапуск фона при «заливке» кадра)
+        # Anti-drift: reset background if too much foreground for too long
         h, w = gL.shape[:2]
         fg_ratio_L = float(np.count_nonzero(mL_final)) / float(h * w)
         fg_ratio_R = float(np.count_nonzero(mR_final)) / float(h * w)
@@ -285,16 +299,16 @@ class StereoMotionDetector:
             self._reset_background()
             self._drift_streak = 0
 
-        # детекции -> боксы
+        # Detection to boxes
         boxesL = _boxes_from_mask(mL_final, min_area=min_area, max_area=max_area)
         boxesR = _boxes_from_mask(mR_final, min_area=min_area, max_area=max_area)
 
-        # НЕБО: отсекаем широкие облачные полосы
+        # Sky: filter wide cloud stripes
         split = float(getattr(self.params, "y_area_split", 0.55))
         boxesL = _shape_gate_sky(boxesL, h, split)
         boxesR = _shape_gate_sky(boxesR, h, split)
 
-        # === SAILS-ONLY: включается, если есть ROI воды ИЛИ передан флаг --sails_only ===
+        # Sails-only mode: enabled if ROI water mask or sails_only flag
         sails_only = bool(getattr(self.params, "sails_only", False))
         if self.roi is not None or sails_only:
             water_split = float(getattr(self.params, "sails_water_split", 0.55))
@@ -307,7 +321,7 @@ class StereoMotionDetector:
             boxesL = _sails_only_gate(boxesL, gL, water_y, white_delta, min_h_over_w, max_w, min_h)
             boxesR = _sails_only_gate(boxesR, gR, water_y, white_delta, min_h_over_w, max_w, min_h)
 
-        # спаривание L/R и досведение NCC
+        # Pairing L/R and NCC matching
         pairs = gate_pairs_rectified(
             boxesL, boxesR,
             float(getattr(self.params, "y_eps", 6.0)),

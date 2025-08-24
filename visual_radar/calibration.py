@@ -6,39 +6,45 @@ from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2 as cv
+import logging
 
 
 @dataclass
 class Calibration:
-    """Ректификация для заданного размера кадра."""
+    """
+    Rectification for a given frame size.
+    """
     mode: str  # "proj" | "metric_maps"
-    size_ref: Tuple[int, int]  # (w, h)
+    size_ref: Tuple[int, int]  # (width, height)
 
-    # Фолбэк: проективная (обычно — идентичность)
+    # Fallback: projective (usually identity)
     H1: Optional[np.ndarray] = None
     H2: Optional[np.ndarray] = None
 
-    # Метрическая ректификация — float-карты (универсальные; можно ресайзить)
+    # Metric rectification — float maps (universal; can be resized)
     map1x: Optional[np.ndarray] = None  # CV_32FC1
     map1y: Optional[np.ndarray] = None  # CV_32FC1
     map2x: Optional[np.ndarray] = None  # CV_32FC1
     map2y: Optional[np.ndarray] = None  # CV_32FC1
 
-    # Метрическая ректификация — быстрые fixed-point карты для remap (предпочтительны при точном размере)
+    # Metric rectification — fast fixed-point maps for remap (preferred for exact size)
     map1L_s16: Optional[np.ndarray] = None  # CV_16SC2
     map2L_u16: Optional[np.ndarray] = None  # CV_16UC1
     map1R_s16: Optional[np.ndarray] = None  # CV_16SC2
     map2R_u16: Optional[np.ndarray] = None  # CV_16UC1
 
-    # Матрица перекидывания диспаритета в 3D (если есть)
+    # Matrix for disparity to 3D conversion (if available)
     Q: Optional[np.ndarray] = None
 
-    # кэш для быстрого ресайза float-карт
+    # Cache for fast resizing of float maps
     _cache_size: Optional[Tuple[int, int]] = None
     _cache_maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None
 
 
 def _try_load_npz(npz_path: Path) -> Dict[str, Any]:
+    """
+    Attempt to load a .npz file and return its contents as a dictionary.
+    """
     data: Dict[str, Any] = {}
     if npz_path.exists():
         with np.load(str(npz_path)) as f:
@@ -58,123 +64,156 @@ def _metric_from_intrinsics(
     alpha: float = 1.0,
 ) -> Calibration:
     """
-    Готовим и float-, и fixed-point (CV_16SC2/CV_16UC1) карты.
-    По докам OpenCV, remap с CV_16SC2 быстрее; float-карты держим для случая,
-    когда фактический размер кадра отличается (их можно качественно ресайзить).
+    Prepare both float and fixed-point (CV_16SC2/CV_16UC1) maps.
+    According to OpenCV docs, remap with CV_16SC2 is faster; float maps are kept for resizing to other frame sizes.
     """
-    w, h = frame_size
+    width, height = frame_size
 
-    # Поле зрения без кропа
-    newK1, _ = cv.getOptimalNewCameraMatrix(K1, D1, (w, h), alpha)
-    newK2, _ = cv.getOptimalNewCameraMatrix(K2, D2, (w, h), alpha)
+    # Field of view without cropping
+    newK1, _ = cv.getOptimalNewCameraMatrix(K1, D1, (width, height), alpha)
+    newK2, _ = cv.getOptimalNewCameraMatrix(K2, D2, (width, height), alpha)
 
     R1, R2, P1, P2, Q, _roi1, _roi2 = cv.stereoRectify(
-        newK1, D1, newK2, D2, (w, h), R, T, flags=cv.CALIB_ZERO_DISPARITY, alpha=alpha
+        newK1, D1, newK2, D2, (width, height), R, T, flags=cv.CALIB_ZERO_DISPARITY, alpha=alpha
     )
 
-    # 1) быстрые карты: CV_16SC2/CV_16UC1
-    m1L_s16, m2L_u16 = cv.initUndistortRectifyMap(newK1, D1, R1, P1, (w, h), cv.CV_16SC2)
-    m1R_s16, m2R_u16 = cv.initUndistortRectifyMap(newK2, D2, R2, P2, (w, h), cv.CV_16SC2)
+    # 1) Fast maps: CV_16SC2/CV_16UC1
+    map1L_s16, map2L_u16 = cv.initUndistortRectifyMap(newK1, D1, R1, P1, (width, height), cv.CV_16SC2)
+    map1R_s16, map2R_u16 = cv.initUndistortRectifyMap(newK2, D2, R2, P2, (width, height), cv.CV_16SC2)
 
-    # 2) float-карты: CV_32FC1 (их можно ресайзить)
-    m1x, m1y = cv.initUndistortRectifyMap(newK1, D1, R1, P1, (w, h), cv.CV_32FC1)
-    m2x, m2y = cv.initUndistortRectifyMap(newK2, D2, R2, P2, (w, h), cv.CV_32FC1)
+    # 2) Float maps: CV_32FC1 (can be resized)
+    map1x, map1y = cv.initUndistortRectifyMap(newK1, D1, R1, P1, (width, height), cv.CV_32FC1)
+    map2x, map2y = cv.initUndistortRectifyMap(newK2, D2, R2, P2, (width, height), cv.CV_32FC1)
 
     return Calibration(
         mode="metric_maps",
-        size_ref=(w, h),
-        map1x=m1x, map1y=m1y, map2x=m2x, map2y=m2y,
-        map1L_s16=m1L_s16, map2L_u16=m2L_u16,
-        map1R_s16=m1R_s16, map2R_u16=m2R_u16,
+        size_ref=(width, height),
+        map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y,
+        map1L_s16=map1L_s16, map2L_u16=map2L_u16,
+        map1R_s16=map1R_s16, map2R_u16=map2R_u16,
         Q=Q
     )
 
 
 def _proj_identity(frame_size: Tuple[int, int]) -> Calibration:
-    w, h = frame_size
+    """
+    Return a projective identity calibration (pass-through).
+    """
+    width, height = frame_size
     H1 = np.eye(3, dtype=np.float64)
     H2 = np.eye(3, dtype=np.float64)
-    return Calibration(mode="proj", size_ref=(w, h), H1=H1, H2=H2, Q=None)
+    return Calibration(mode="proj", size_ref=(width, height), H1=H1, H2=H2, Q=None)
+
+
+def _load_intrinsics(data: Dict[str, Any], frame_size: Tuple[int, int]) -> Optional[Calibration]:
+    """
+    Load calibration from intrinsics dictionary if all required keys are present.
+    """
+    K1 = data.get("K1")
+    K2 = data.get("K2")
+    D1 = data.get("D1")
+    D2 = data.get("D2")
+    R = data.get("R")
+    T = data.get("T")
+    if all(x is not None for x in (K1, D1, K2, D2, R, T)):
+        return _metric_from_intrinsics(K1, D1, K2, D2, R, T, frame_size, alpha=1.0)
+    return None
 
 
 def load_calibration(
     calib_dir: Path,
     intrinsics: Optional[Path],
     frame_size: Tuple[int, int],
-    baseline_m: Optional[float] = None,  # оставлено для совместимости сигнатур
+    baseline_m: Optional[float] = None,
 ) -> Calibration:
     """
-    Пытаемся загрузить и/или построить ректификацию для (width,height).
+    Try to load and/or build rectification for (width, height).
 
-    Приоритет:
-    1) Указанный intrinsics .npz с K1,K2,D1,D2,R,T → считаем карты.
-    2) <calib_dir>/intrinsics.npz → считаем карты.
-    3) Фолбэк: проективная идентичность (пропуск без изменений).
+    Priority:
+    1) Provided intrinsics .npz with K1, K2, D1, D2, R, T → compute maps.
+    2) <calib_dir>/intrinsics.npz → compute maps.
+    3) Fallback: projective identity (pass-through).
     """
-    w, h = frame_size
-
-    # 1) Явный путь
+    # 1) Explicit path
     if intrinsics is not None:
         data = _try_load_npz(Path(intrinsics))
-        K1 = data.get("K1"); K2 = data.get("K2")
-        D1 = data.get("D1"); D2 = data.get("D2")
-        R  = data.get("R");  T  = data.get("T")
-        if all(x is not None for x in (K1, D1, K2, D2, R, T)):
-            return _metric_from_intrinsics(K1, D1, K2, D2, R, T, (w, h), alpha=1.0)
+        calib = _load_intrinsics(data, frame_size)
+        if calib:
+            return calib
 
-    # 2) Директория калибровки
+    # 2) Calibration directory
     npz_path = Path(calib_dir) / "intrinsics.npz"
     data = _try_load_npz(npz_path)
-    if data:
-        K1 = data.get("K1"); K2 = data.get("K2")
-        D1 = data.get("D1"); D2 = data.get("D2")
-        R  = data.get("R");  T  = data.get("T")
-        if all(x is not None for x in (K1, D1, K2, D2, R, T)):
-            return _metric_from_intrinsics(K1, D1, K2, D2, R, T, (w, h), alpha=1.0)
+    calib = _load_intrinsics(data, frame_size)
+    if calib:
+        return calib
 
-    # 3) Фолбэк
-    return _proj_identity((w, h))
+    # 3) Fallback
+    return _proj_identity(frame_size)
 
 
-def rectified_pair(calib: Calibration, imgL, imgR):
+def rectified_pair(
+    calib: Calibration,
+    img_left: np.ndarray,
+    img_right: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Применить ректификацию/ремап без кропа (full FOV).
-    Используем быстрые fixed-point карты, если размер кадра совпадает с эталонным;
-    если нет — аккуратно ресайзим float-карты под текущий размер.
+    Apply rectification/remap without cropping (full FOV).
+    Uses fast fixed-point maps if frame size matches reference;
+    otherwise, resizes float maps for current size.
     """
     if calib.mode == "metric_maps" and (calib.map1x is not None or calib.map1L_s16 is not None):
-        h, w = imgL.shape[:2]
-        mw, mh = calib.size_ref
+        height, width = img_left.shape[:2]
+        ref_width, ref_height = calib.size_ref
 
-        if (w, h) == (mw, mh) and calib.map1L_s16 is not None:
-            # Быстрый путь: CV_16SC2/CV_16UC1
-            rL = cv.remap(imgL, calib.map1L_s16, calib.map2L_u16,
-                          interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-            rR = cv.remap(imgR, calib.map1R_s16, calib.map2R_u16,
-                          interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-            return rL, rR
+        if (width, height) == (ref_width, ref_height) and calib.map1L_s16 is not None:
+            # Fast path: CV_16SC2/CV_16UC1
+            rectified_left = cv.remap(
+                img_left, calib.map1L_s16, calib.map2L_u16,
+                interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+            )
+            rectified_right = cv.remap(
+                img_right, calib.map1R_s16, calib.map2R_u16,
+                interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+            )
+            return rectified_left, rectified_right
 
-        # Медленный, но универсальный путь: float-карты, с кэшем под целевой размер
-        if calib._cache_size != (w, h):
-            map1x = cv.resize(calib.map1x, (w, h), interpolation=cv.INTER_LINEAR)
-            map1y = cv.resize(calib.map1y, (w, h), interpolation=cv.INTER_LINEAR)
-            map2x = cv.resize(calib.map2x, (w, h), interpolation=cv.INTER_LINEAR)
-            map2y = cv.resize(calib.map2y, (w, h), interpolation=cv.INTER_LINEAR)
-            calib._cache_size = (w, h)
+        # Slow but universal path: float maps, cached for target size
+        if calib._cache_size != (width, height):
+            map1x = cv.resize(calib.map1x, (width, height), interpolation=cv.INTER_LINEAR)
+            map1y = cv.resize(calib.map1y, (width, height), interpolation=cv.INTER_LINEAR)
+            map2x = cv.resize(calib.map2x, (width, height), interpolation=cv.INTER_LINEAR)
+            map2y = cv.resize(calib.map2y, (width, height), interpolation=cv.INTER_LINEAR)
+            calib._cache_size = (width, height)
             calib._cache_maps = (map1x, map1y, map2x, map2y)
-            if calib.Q is not None and (w, h) != (mw, mh):
-                # для точной глубины лучше пересчитать калибровку под новый размер
-                print("[!] Q is for size", (mw, mh), "— recompute calibration for accurate depth at", (w, h))
+            if calib.Q is not None and (width, height) != (ref_width, ref_height):
+                logging.warning(
+                    "Q matrix is for size %s — recompute calibration for accurate depth at %s",
+                    (ref_width, ref_height), (width, height)
+                )
 
         map1x, map1y, map2x, map2y = calib._cache_maps
-        rL = cv.remap(imgL, map1x, map1y, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-        rR = cv.remap(imgR, map2x, map2y, interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-        return rL, rR
+        rectified_left = cv.remap(
+            img_left, map1x, map1y,
+            interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+        )
+        rectified_right = cv.remap(
+            img_right, map2x, map2y,
+            interpolation=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+        )
+        return rectified_left, rectified_right
 
-    # Фолбэк: проективно (по умолчанию — идентичность)
+    # Fallback: projective (default — identity)
     H1 = calib.H1 if calib.H1 is not None else np.eye(3, dtype=np.float64)
     H2 = calib.H2 if calib.H2 is not None else np.eye(3, dtype=np.float64)
-    w = imgL.shape[1]; h = imgL.shape[0]
-    rL = cv.warpPerspective(imgL, H1, (w, h), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-    rR = cv.warpPerspective(imgR, H2, (w, h), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-    return rL, rR
+    width = img_left.shape[1]
+    height = img_left.shape[0]
+    rectified_left = cv.warpPerspective(
+        img_left, H1, (width, height),
+        flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+    )
+    rectified_right = cv.warpPerspective(
+        img_right, H2, (width, height),
+        flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
+    )
+    return rectified_left, rectified_right

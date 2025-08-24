@@ -3,24 +3,33 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-# --- ВРЕМЯ ---
+# --- TIME UTILITIES ---
 
 def monotonic_s() -> float:
-    """Монотонные секунды (не зависят от сдвигов системных часов)."""
+    """
+    Monotonic seconds (not affected by system clock changes).
+    """
     return float(time.monotonic())
 
 def now_s() -> float:
-    """Алиас, чтобы не ломать существующие импорты."""
+    """
+    Alias for monotonic_s, for compatibility with existing imports.
+    """
     return monotonic_s()
 
 def wallclock_stamp() -> str:
-    """Читаемая метка локального времени для имён файлов."""
+    """
+    Readable local time stamp for file names.
+    """
     return time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
-# --- ГЕОМЕТРИЯ ---
+# --- GEOMETRY ---
 
 @dataclass
 class BBox:
+    """
+    Bounding box in (x, y, w, h) format.
+    """
     x: float
     y: float
     w: float
@@ -28,12 +37,20 @@ class BBox:
 
     @property
     def cx(self) -> float:
+        """
+        Center x-coordinate.
+        """
         return float(self.x + self.w * 0.5)
 
     @property
     def cy(self) -> float:
+        """
+        Center y-coordinate.
+        """
         return float(self.y + self.h * 0.5)
 
     def to_int(self) -> tuple[int, int, int, int]:
+        """
+        Convert bounding box coordinates to integers.
+        """
         return int(self.x), int(self.y), int(self.w), int(self.h)
-
