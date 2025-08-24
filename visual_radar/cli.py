@@ -158,6 +158,38 @@ def args_to_config(args) -> AppConfig:
         drop_artifacts=not bool(args.no_drop_artifacts),
     )
 
+# --- FFmpeg debug helpers -----------------------------------------------------
+
+def _ff_tail(reader) -> str:
+    """
+    Вернёт последние строки stderr от ffmpeg, если ридер это поддерживает.
+    Безопасно: если метода нет — вернёт пустую строку.
+    """
+    try:
+        if hasattr(reader, "last_stderr"):
+            return reader.last_stderr() or ""
+    except Exception as e:
+        return f"<stderr read error: {e!r}>"
+    return ""
+
+def _ff_state(tag: str, reader) -> None:
+    """
+    Сдампить полезную диагностику по процессу и stderr.
+    """
+    rc = None
+    try:
+        proc = getattr(reader, "proc", None)
+        if proc is not None:
+            rc = proc.poll()
+    except Exception:
+        pass
+
+    tail = _ff_tail(reader)
+    if rc is not None:
+        logging.warning("[ffmpeg:%s] rc=%s", tag, rc)
+    if tail:
+        logging.warning("[ffmpeg:%s] stderr tail:\n%s", tag, tail)
+
 
 def is_artifact_frame(bgr: np.ndarray) -> bool:
     """
@@ -236,11 +268,16 @@ def run(cfg: AppConfig) -> None:
                     reader=cfg.reader, ffmpeg=cfg.ffmpeg,
                     mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
                     cap_buffersize=cfg.cap_buffersize)
+    logging.info("Reader LEFT : %s.%s", L.__class__.__module__, L.__class__.__name__)
+    logging.info("Reader RIGHT: %s.%s", R.__class__.__module__, R.__class__.__name__)
 
     okL, frameL0, _ = warmup(L, timeout_s=20.0)
     okR, frameR0, _ = warmup(R, timeout_s=20.0)
 
     if not okL or not okR:
+        # <<< добавили диагностику перед остановкой >>>
+        _ff_state("L", L)
+        _ff_state("R", R)
         logging.error("[warmup] No frames within 20s. Stopping.")
         try:
             L.release()
@@ -317,6 +354,14 @@ def run(cfg: AppConfig) -> None:
                 okr, _, _ = R.read()
                 failL += int(not okl)
                 failR += int(not okr)
+
+                # <<< добавили: «ступеньки» для логов при затяжной тишине >>>
+                if failL in (5, 20, 100):
+                    logging.warning("[left] no frames, failL=%d", failL)
+                    _ff_state("L", L)
+                if failR in (5, 20, 100):
+                    logging.warning("[right] no frames, failR=%d", failR)
+                    _ff_state("R", R)
             else:
                 # Artifact frame filter
                 if cfg.drop_artifacts and (is_artifact_frame(frameL) or is_artifact_frame(frameR)):
@@ -385,14 +430,17 @@ def run(cfg: AppConfig) -> None:
             # Reconnect on silence or frequent failures
             if (time.time() - last_ok) > cfg.stall_timeout or failL >= cfg.max_consec_fail:
                 logging.warning("[health] Reopen LEFT stream…")
+                _ff_state("L", L)                 # <<< добавили
                 try:
                     L.reopen()
                 except Exception:
                     pass
                 failL = 0
                 last_ok = time.time()
+
             if (time.time() - last_ok) > cfg.stall_timeout or failR >= cfg.max_consec_fail:
                 logging.warning("[health] Reopen RIGHT stream…")
+                _ff_state("R", R)                 # <<< добавили
                 try:
                     R.reopen()
                 except Exception:

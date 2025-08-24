@@ -1,6 +1,8 @@
 # visual_radar/io.py
 from __future__ import annotations
 
+from asyncio.log import logger
+import logging
 from typing import Optional, Tuple
 import os
 import shutil
@@ -10,10 +12,13 @@ import queue
 import time
 from pathlib import Path
 
+
 import numpy as np
 import cv2 as cv
 
 from visual_radar.utils import now_s
+
+log = logging.getLogger("visual_radar.io.ffmpeg_mjpeg")
 
 # -----------------------------
 # Utilities
@@ -24,15 +29,18 @@ def _is_rtsp(url: str) -> bool:
     except Exception:
         return False
 
+def now_s() -> float:
+    return time.time()
 
 # -----------------------------
 # FFmpeg → MJPEG reader (robust for RTSP)
 # -----------------------------
+
+
 class FFmpegRTSP_MJPEG:
     """
-    RTSP → ffmpeg (TCP) → MJPEG (image2pipe) → cv2.imdecode.
-    Non-blocking read() with timeout so outer loop can reconnect.
-    API: read() -> (ok, frame, ts), isOpened(), reopen(), release()
+    RTSP → ffmpeg → MJPEG(stdout) → cv2.imdecode
+    Неблокирующее read(): (ok, frame, ts) или (False, None, None)
     """
 
     def __init__(
@@ -44,7 +52,10 @@ class FFmpegRTSP_MJPEG:
         ffmpeg_cmd: str = "ffmpeg",
         q: int = 6,
         threads: int = 3,
-        read_timeout: float = 0.2,  # short timeout by default
+        read_timeout: float = 0.2,
+        stimeout_s: float = 5.0,          # RTSP-сокет таймаут (сек)
+        capture_stderr: bool = True,      # включим по умолчанию для диагностики
+        name: str = "",                   # метка для левого/правого канала в логах
     ):
         self.url = url
         self.w = int(width) if width else 0
@@ -54,14 +65,114 @@ class FFmpegRTSP_MJPEG:
         self.q = int(q)
         self.threads = int(threads)
         self.read_timeout = float(read_timeout)
+        self.stimeout_us = int(max(0.0, stimeout_s) * 1_000_000)
+        self.capture_stderr = capture_stderr
+
+        # логгер экземпляра
+        self.log = log.getChild(name or f"{id(self):x}")
 
         self.proc: Optional[subprocess.Popen] = None
         self.buf = bytearray()
         self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=2)
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
+        self._err_thr: Optional[threading.Thread] = None
+        self._stderr_tail = []
+        self._stderr_lock = threading.Lock()
+
+        # статистика для диагностики
+        self._frames_ok = 0
+        self._frames_dropped_q = 0
+        self._frames_bad_jpeg = 0
+        self._bytes_in = 0
+        self._last_stat_t = now_s()
+        self._consec_timeouts = 0
+
+        self._rtsp_timeout_key = self._choose_rtsp_timeout_key()
+        self.log.info("RTSP timeout key selected: %s",
+                    f"-{self._rtsp_timeout_key}" if self._rtsp_timeout_key else "<none>")
 
         self._start()
+
+    def _choose_rtsp_timeout_key(self) -> Optional[str]:
+        """
+        Проверяем, какие опции доступны в этой сборке ffmpeg для протокола rtsp.
+        Возвращаем 'stimeout' или 'rw_timeout' или 'timeout' — либо None.
+        Никаких падений, если что-то не вышло.
+        """
+        candidates = ("stimeout", "rw_timeout", "timeout")
+        try:
+            # 1) Посмотреть справку протокола RTSP
+            out = subprocess.run(
+                [self.ffmpeg_cmd, "-hide_banner", "-loglevel", "quiet", "-h", "protocol=rtsp"],
+                capture_output=True, text=True, timeout=2.0
+            )
+            text = (out.stdout or "") + (out.stderr or "")
+            for key in candidates:
+                if key in text:
+                    return key
+        except Exception:
+            pass
+
+        # 2) fallback: общая справка (на некоторых сборках нет protocol=rtsp)
+        try:
+            out = subprocess.run(
+                [self.ffmpeg_cmd, "-hide_banner", "-loglevel", "quiet", "-h"],
+                capture_output=True, text=True, timeout=2.0
+            )
+            text = (out.stdout or "") + (out.stderr or "")
+            for key in candidates:
+                if key in text:
+                    return key
+        except Exception:
+            pass
+
+        # 3) Финальный фоллбэк — ничего не добавляем
+        return None
+
+
+    def _build_cmd(self) -> list:
+        scale = []
+        if self.w and self.h:
+            scale = ["-vf", f"scale={self.w}:{self.h}:flags=bicubic"]
+
+        cmd = [
+            self.ffmpeg_cmd,
+            "-hide_banner", "-loglevel", "warning", "-nostats", "-nostdin",
+            "-rtsp_transport", "tcp" if self.use_tcp else "udp",
+            "-rtsp_flags", "prefer_tcp",                # безопасно даже на старых сборках
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-use_wallclock_as_timestamps", "1",
+            "-analyzeduration", "1000000",              # 1s
+            "-probesize", "1000000",                    # 1MB
+        ]
+
+        # Добавляем таймаут только если точно поддерживается
+        if self._rtsp_timeout_key:
+            # почти везде — микросекунды; вы уже храните self.stimeout_us
+            cmd += [f"-{self._rtsp_timeout_key}", str(self.stimeout_us)]
+
+        # вход
+        cmd += ["-i", self.url, "-an"]
+
+        # масштабирование (если задано)
+        cmd += scale
+
+        # Никаких -vsync: старые сборки выдают warning, а нужды нет
+        # если очень хочется аналог — можно попробовать fps_mode=passthrough,
+        # но на старых сборках его тоже может не быть.
+
+        # Вывод: поток MJPEG в stdout
+        cmd += [
+            "-f", "mjpeg",
+            "-c:v", "mjpeg",
+            "-threads", str(self.threads),
+            "-q:v", str(self.q),
+            "-"
+        ]
+        return cmd
+
 
     def _start(self) -> None:
         if not (shutil.which(self.ffmpeg_cmd) or os.path.exists(self.ffmpeg_cmd)):
@@ -73,57 +184,125 @@ class FFmpegRTSP_MJPEG:
 
         cmd = [
             self.ffmpeg_cmd,
-            "-hide_banner", "-loglevel", "warning",
-            "-rtsp_transport", "tcp" if self.use_tcp else "udp",
-            "-rtsp_flags", "prefer_tcp",
-            "-rw_timeout", "5000000",            # 5s I/O timeout
-            "-analyzeduration", "10000000",
-            "-probesize", "10000000",
-            "-fflags", "+genpts+igndts",
-            "-flags", "+low_delay",
+            "-hide_banner", "-loglevel", "warning", "-nostats", "-nostdin",
+            "-rtsp_transport", "tcp" if self.use_tcp else "udp",]
+        # Добавляем таймаут только если точно поддерживается
+        if self._rtsp_timeout_key:
+            # почти везде — микросекунды; вы уже храните self.stimeout_us
+            cmd += [f"-{self._rtsp_timeout_key}", str(self.stimeout_us)]
+
+
+        cmd += ["-fflags", "nobuffer",
+            "-flags", "low_delay",
             "-use_wallclock_as_timestamps", "1",
+            "-analyzeduration", "1000000",
+            "-probesize", "1000000",
             "-i", self.url,
             "-an",
             *scale,
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
+            "-f", "mjpeg",
+            "-c:v", "mjpeg",
             "-threads", str(self.threads),
             "-q:v", str(self.q),
             "-",
         ]
+        self.log.info("spawn ffmpeg: %s", " ".join(map(str, cmd)))
+
+        stderr_target = subprocess.PIPE if self.capture_stderr else subprocess.DEVNULL
         self.proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=10**7,
+            cmd, stdout=subprocess.PIPE, stderr=stderr_target, bufsize=0
         )
         self.buf.clear()
         self._stop.clear()
         self._thr = threading.Thread(target=self._reader, daemon=True)
         self._thr.start()
+        self.log.debug("reader thread started")
+
+        if self.capture_stderr and self.proc.stderr is not None:
+            self._err_thr = threading.Thread(target=self._stderr_reader, daemon=True)
+            self._err_thr.start()
+            self.log.debug("stderr reader thread started")
+
+
+    def _stderr_reader(self) -> None:
+        MAX_LINES = 200
+        try:
+            assert self.proc and self.proc.stderr
+            for line in iter(self.proc.stderr.readline, b""):
+                s = line.decode("utf-8", "replace").rstrip()
+                with self._stderr_lock:
+                    self._stderr_tail.append(s)
+                    if len(self._stderr_tail) > MAX_LINES:
+                        self._stderr_tail = self._stderr_tail[-MAX_LINES:]
+                if self._stop.is_set():
+                    break
+        except Exception as e:
+            self.log.debug("stderr reader stopped: %r", e)
+
+    def last_stderr(self) -> str:
+        with self._stderr_lock:
+            return "\n".join(self._stderr_tail[-50:])
+
+
+    def _log_stats_periodically(self) -> None:
+        t = now_s()
+        if t - self._last_stat_t >= 5.0:
+            fps = self._frames_ok / max(1e-9, t - self._last_stat_t)
+            self.log.info(
+                "stats: fps=%.1f ok=%d dropped_q=%d bad_jpeg=%d bytes=%d",
+                fps, self._frames_ok, self._frames_dropped_q, self._frames_bad_jpeg, self._bytes_in
+            )
+            self._frames_ok = 0
+            self._frames_dropped_q = 0
+            self._frames_bad_jpeg = 0
+            self._bytes_in = 0
+            self._last_stat_t = t
 
     def _reader(self) -> None:
-        """Background thread: split JPEGs and push to queue without blocking."""
         CHUNK = 65536
         SOI, EOI = b"\xff\xd8", b"\xff\xd9"
-        while not self._stop.is_set() and self.proc and self.proc.poll() is None:
+        stdout = self.proc.stdout if self.proc else None
+
+        def _stats():
+            t = time.time()
+            if t - self._last_stat_t >= 5.0:
+                fps = self._frames_ok / max(1e-9, t - self._last_stat_t)
+                self.log.info("stats: fps=%.1f ok=%d dropped_q=%d bad_jpeg=%d bytes=%d",
+                            fps, self._frames_ok, self._frames_dropped_q,
+                            self._frames_bad_jpeg, self._bytes_in)
+                self._frames_ok = self._frames_dropped_q = self._frames_bad_jpeg = 0
+                self._bytes_in = 0
+                self._last_stat_t = t
+
+        while not self._stop.is_set():
+            if self.proc is None or self.proc.poll() is not None:
+                rc = None if self.proc is None else self.proc.poll()
+                self.log.warning("ffmpeg exited early (rc=%s). stderr tail:\n%s", rc, self.last_stderr())
+                break
+            if stdout is None:
+                self.log.error("ffmpeg stdout is None")
+                break
+
             try:
-                data = self.proc.stdout.read(CHUNK)  # type: ignore[arg-type]
+                data = stdout.read(CHUNK)
                 if not data:
                     time.sleep(0.01)
                     continue
+
+                self._bytes_in += len(data)
                 self.buf += data
-                # extract full JPEGs
+
                 while True:
                     i = self.buf.find(SOI)
                     if i == -1:
-                        # guard against garbage growth
                         if len(self.buf) > 10 * CHUNK:
+                            self.log.debug("buffer purge (no SOI, size=%d)", len(self.buf))
                             self.buf.clear()
                         break
                     j = self.buf.find(EOI, i + 2)
                     if j == -1:
                         if len(self.buf) > 20 * CHUNK:
+                            self.log.debug("buffer trim (no EOI, size=%d)", len(self.buf))
                             del self.buf[:i]
                         break
                     jpg = bytes(self.buf[i:j + 2])
@@ -131,60 +310,100 @@ class FFmpegRTSP_MJPEG:
                     try:
                         self._q.put_nowait(jpg)
                     except queue.Full:
-                        # drop frame if queue is full
-                        pass
-            except Exception:
+                        self._frames_dropped_q += 1
+                        if self._frames_dropped_q % 20 == 1:
+                            self.log.debug("queue full, dropping (dropped=%d)", self._frames_dropped_q)
+
+                _stats()
+
+            except Exception as e:
+                self.log.warning("reader exception: %r", e)
                 time.sleep(0.01)
                 continue
+
+        self.log.debug("reader thread finished")
+
+    def last_stderr(self) -> str:
+        with self._stderr_lock:
+            return "\n".join(self._stderr_tail[-50:])
 
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
-        """
-        Non-blocking read: on timeout returns (False, None, None).
-        Outer loop may call reopen() if timeouts persist.
-        """
+    def read(self):
         if self.proc is None or self.proc.poll() is not None:
+            self.log.warning("read(): ffmpeg not running, reopen()")
             self.reopen()
-            time.sleep(0.1)
+            time.sleep(0.05)
+
         try:
             jpg = self._q.get(timeout=self.read_timeout)
+            self._consec_timeouts = 0
         except queue.Empty:
+            self._consec_timeouts += 1
+            if self._consec_timeouts in (5, 20, 100):
+                self.log.warning(
+                    "no frames for %.1fs (timeouts=%d). rc=%s\nstderr tail:\n%s",
+                    self._consec_timeouts * self.read_timeout,
+                    self._consec_timeouts,
+                    None if self.proc is None else self.proc.poll(),
+                    self.last_stderr(),
+                )
             return False, None, None
 
         arr = np.frombuffer(jpg, dtype=np.uint8)
         frame = cv.imdecode(arr, cv.IMREAD_COLOR)
         if frame is None:
+            self._frames_bad_jpeg += 1
+            if self._frames_bad_jpeg % 10 == 1:
+                self.log.debug("imdecode failed (bad_jpeg=%d, size=%d)", self._frames_bad_jpeg, len(jpg))
             return False, None, None
-        return True, frame, now_s()
+
+        self._frames_ok += 1
+        return True, frame, time.time()
 
     def reopen(self) -> None:
-        """Restart ffmpeg process and clear buffer/queue."""
+        self.log.info("reopen ffmpeg")
         self.release()
         self._start()
 
     def release(self) -> None:
-        """Terminate ffmpeg and cleanup resources."""
-        try:
-            self._stop.set()
-            if self._thr and self._thr.is_alive():
-                self._thr.join(timeout=1.0)
-        except Exception:
-            pass
+        self._stop.set()
         try:
             if self.proc:
-                self.proc.kill()
-                if self.proc.stdout:
-                    self.proc.stdout.close()
+                try:
+                    self.proc.terminate(); self.proc.wait(timeout=0.5)
+                except Exception:
+                    pass
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                try:
+                    if self.proc.stdout: self.proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if self.proc.stderr: self.proc.stderr.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log.debug("release: proc close error: %r", e)
+
+        try:
+            if self._thr and self._thr.is_alive(): self._thr.join(timeout=1.0)
         except Exception:
             pass
-        self.proc = None
-        self._thr = None
-        with self._q.mutex:
-            self._q.queue.clear()
+        try:
+            if self._err_thr and self._err_thr.is_alive(): self._err_thr.join(timeout=0.5)
+        except Exception:
+            pass
 
-
+        self.proc = None; self._thr = None; self._err_thr = None
+        with self._q.mutex: self._q.queue.clear()
+        self.buf.clear()
+        self.log.info("released")
+    
 # -----------------------------
 # OpenCV VideoCapture reader (fallback)
 # -----------------------------
