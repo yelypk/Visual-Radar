@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 import cv2 as cv
 import logging
 
+try:
+    from visual_radar.io import FFmpegRTSP_MJPEG  # noqa: F401
+except Exception:
+    FFmpegRTSP_MJPEG = None  # type: ignore
 
 @dataclass
 class Calibration:
@@ -217,3 +221,60 @@ def rectified_pair(
         flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE
     )
     return rectified_left, rectified_right
+
+# MJPEG calibration utilities
+
+def open_mjpeg_for_calibration(
+    url: str,
+    frame_size: Tuple[int, int],
+    ffmpeg: str = "ffmpeg",
+    quality: int = 6,
+    threads: int = 3,
+    read_timeout: float = 1.0,
+):
+
+    if FFmpegRTSP_MJPEG is None:
+        raise RuntimeError("FFmpegRTSP_MJPEG is unavailable — check that visual_radar.io is importable.")
+    width, height = map(int, frame_size)
+    return FFmpegRTSP_MJPEG(
+        url=url,
+        width=width,
+        height=height,
+        use_tcp=True,
+        ffmpeg_cmd=ffmpeg,
+        q=int(quality),
+        threads=int(threads),
+        read_timeout=float(read_timeout),
+    )
+
+
+def collect_calibration_frames(
+    url: str,
+    frame_size: Tuple[int, int],
+    n_frames: int = 30,
+    ffmpeg: str = "ffmpeg",
+    quality: int = 6,
+    threads: int = 3,
+    read_timeout: float = 1.0,
+) -> List[np.ndarray]:
+    reader = open_mjpeg_for_calibration(
+        url=url,
+        frame_size=frame_size,
+        ffmpeg=ffmpeg,
+        quality=quality,
+        threads=threads,
+        read_timeout=read_timeout,
+    )
+    frames: List[np.ndarray] = []
+    try:
+        while len(frames) < n_frames:
+            ok, frame, _ = reader.read()
+            if not ok or frame is None:
+                continue
+            frames.append(frame)
+    finally:
+        try:
+            reader.release()
+        except Exception:
+            pass
+    return frames
