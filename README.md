@@ -1,12 +1,15 @@
 # Visual-Radar
 
+The project I am working on. 
 Stereo surveillance on **OpenCV 4.x**. The app reads **two RTSP cameras**, time-syncs frames, rectifies them, detects motion, and **pairs L/R objects** along the epipolar line.
 
-## Features
-- Inputs: **RTSP H.264** (OpenCV/FFmpeg backend) or **FFmpeg → MJPEG** pipe.
-- L/R time synchronization (default tolerance 50 ms) with catch-up reads.
-- Rectification with cached `remap` maps.
-- Motion detection: dual background model (fast/slow), optional CLAHE, ROI and sky/water split.
-- Stereo pairing: vertical gate + **NCC** (on gradients) with sub-pixel refinement.
-- Tracking: lightweight IoU tracker with hysteresis.
-- HUD overlay: FPS, L/R time delta, night/day flag, fail counters.
+**Results**
+
+<p float="left">
+  <img src="./images/camera.jpg" width="49%">
+  <img src="./images/cameraD.jpg" width="49%">
+</p>
+
+**Next development steps**
+
+Align the two cameras with each other—i.e., estimate their relative orientation angle in 3D space. The cameras are mounted at the window, so this should be done using distant landmarks as references.
