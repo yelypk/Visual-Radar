@@ -10,6 +10,56 @@ from visual_radar.utils import BBox
 from visual_radar.io import open_stream  # RTSP reader (opencv | ffmpeg_mjpeg)
 
 # -----------------------------
+# Photometric helpers
+# -----------------------------
+class PhotometricStabilizer:
+    def __init__(self, alpha_clip: float = 3.0, momentum: float = 0.02):
+        self.m = None
+        self.s = None
+        self.alpha_clip = float(alpha_clip)
+        self.momentum = float(momentum)
+
+    def __call__(self, bgr: np.ndarray) -> np.ndarray:
+        lab = cv.cvtColor(bgr, cv.COLOR_BGR2LAB)
+        L = lab[:, :, 0].astype(np.float32)
+        m, s = cv.meanStdDev(L)
+        m = float(m); s = float(s) + 1e-6
+        if self.m is None:
+            self.m, self.s = m, s
+        self.m = (1 - self.momentum) * self.m + self.momentum * m
+        self.s = (1 - self.momentum) * self.s + self.momentum * s
+        a = np.clip(self.s / s, 1.0 / self.alpha_clip, self.alpha_clip)
+        b = self.m - a * m
+        Ln = np.clip(a * L + b, 0, 255).astype(np.uint8)
+        lab[:, :, 0] = Ln
+        return cv.cvtColor(lab, cv.COLOR_LAB2BGR)
+
+def _wb_grayworld_safe(bgr: np.ndarray) -> np.ndarray:
+    try:
+        wb = cv.xphoto.createGrayworldWB()
+        wb.setSaturationThreshold(0.98)
+        return wb.balanceWhite(bgr)
+    except Exception:
+        return bgr
+
+def _sky_tone_compress(bgr: np.ndarray, y_split_frac: float, gamma: float = 1.25,
+                       clahe_clip: float = 2.0, clahe_tile: int = 8) -> np.ndarray:
+    H = bgr.shape[0]
+    y = int(H * float(y_split_frac))
+    top = bgr[:y]
+    bot = bgr[y:]
+    ycc = cv.cvtColor(top, cv.COLOR_BGR2YCrCb)
+    Y = ycc[:, :, 0].astype(np.float32) / 255.0
+    Y = np.power(Y, float(gamma))
+    ycc[:, :, 0] = np.clip(Y * 255.0, 0, 255).astype(np.uint8)
+    top = cv.cvtColor(ycc, cv.COLOR_YCrCb2BGR)
+    lab = cv.cvtColor(top, cv.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv.createCLAHE(clipLimit=float(clahe_clip),
+                                  tileGridSize=(int(clahe_tile), int(clahe_tile))).apply(lab[:, :, 0])
+    top = cv.cvtColor(lab, cv.COLOR_LAB2BGR)
+    return np.vstack([top, bot])
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def as_gray(img: np.ndarray) -> np.ndarray:
@@ -26,10 +76,6 @@ def as_gray(img: np.ndarray) -> np.ndarray:
 
 
 def _kernel_from_area(min_area: int, boost: float = 1.0) -> Tuple[int, int]:
-    """
-    Choose a morphology kernel size from area:
-    min_area ~ k^2  ->  k ~ sqrt(min_area).
-    """
     k = int(max(3, np.sqrt(max(1, float(min_area))) * 0.50 * float(boost)))
     if k % 2 == 0:
         k += 1
@@ -38,7 +84,6 @@ def _kernel_from_area(min_area: int, boost: float = 1.0) -> Tuple[int, int]:
 
 
 def _morph_clean(mask: np.ndarray, min_area: int, size_aware_morph: bool = True) -> np.ndarray:
-    """Open+Close with size-aware kernel to denoise the mask."""
     if mask is None or mask.size == 0:
         return mask
     mask = (mask > 0).astype(np.uint8) * 255
@@ -53,7 +98,6 @@ def _morph_clean(mask: np.ndarray, min_area: int, size_aware_morph: bool = True)
 
 
 def _boxes_from_mask(mask: np.ndarray, min_area: int, max_area: int) -> List[BBox]:
-    """Extract bounding boxes from a binary mask."""
     boxes: List[BBox] = []
     if mask is None or mask.size == 0:
         return boxes
@@ -70,7 +114,6 @@ def _boxes_from_mask(mask: np.ndarray, min_area: int, max_area: int) -> List[BBo
 
 
 def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    """Intersection-over-Union for two boxes (x1,y1,x2,y2)."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     x1, y1 = max(ax1, bx1), max(ay1, by1)
@@ -114,18 +157,13 @@ def find_motion_bboxes(
     thr_slow: float,
     use_clahe: bool = True,
     size_aware_morph: bool = True,
-    learning_rate: float = -1.0,   # NEW: pass-through LR to keep slow targets in FG
+    learning_rate: float = -1.0,
 ) -> Tuple[np.ndarray, List[BBox]]:
-    """
-    Weighted union of fast/slow MOG2 masks → morph → boxes.
-    If you want slow movers (boats) to remain foreground, pass a small learning_rate, e.g. 0.0005.
-    """
     g = gray
     if use_clahe:
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         g = clahe.apply(g)
 
-    # Use the given learning rate for both models
     mf = bg.apply_fast(g, lr=learning_rate)
     ms = bg.apply_slow(g, lr=learning_rate)
 
@@ -150,7 +188,6 @@ def make_masks_static_and_slow(
     use_clahe: bool = True,
     kernel_size: int = 3,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Utility that returns (static_mask, slow_mask) for debugging."""
     g = gray
     if use_clahe:
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -173,7 +210,6 @@ def make_masks_static_and_slow(
 
 
 def _draw_boxes(frame: np.ndarray, boxes_speeds: List[Tuple[Tuple[int, int, int, int], float, float]]) -> None:
-    """Draw boxes with area and speed."""
     for (x1, y1, x2, y2), area, speed in boxes_speeds:
         cv.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv.putText(
@@ -191,7 +227,6 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser(description="Motion detection for fast (birds) and slow (boats) targets")
-    # NEW: support legacy flags --left/--right and alias --timeout
     ap.add_argument("--url", help="RTSP URL (single stream)")
     ap.add_argument("--left", help="Alias for --url (use LEFT stream if both given)")
     ap.add_argument("--right", help="Alias for --url (used if --url/--left missing)")
@@ -242,9 +277,13 @@ def main():
     ap.add_argument("--save-snaps", action="store_true")
     ap.add_argument("--save-dir", default="detections")
 
+    # --- NEW: photometric preprocess flags
+    ap.add_argument("--wb-grayworld", action="store_true", help="Stabilize white balance via xphoto Grayworld")
+    ap.add_argument("--photometric", action="store_true", help="Photometric L-channel stabilization (LAB)")
+    ap.add_argument("--sky-gamma", type=float, default=0.0, help=">0 → gamma compress top sky region (1.2–1.35)")
+
     args = ap.parse_args()
 
-    # Resolve URL from --url / --left / --right
     if not args.url:
         args.url = args.left or args.right
     if not args.url:
@@ -257,7 +296,6 @@ def main():
     bg.fast.setHistory(args.history_fast)
     bg.slow.setHistory(args.history_slow)
 
-    # Open stream (ffmpeg_mjpeg is recommended for RTSP)
     r = open_stream(
         url=args.url, width=args.width, height=args.height,
         reader=args.reader, ffmpeg=args.ffmpeg, mjpeg_q=args.mjpeg_q,
@@ -278,11 +316,13 @@ def main():
     if args.save_snaps:
         outdir.mkdir(parents=True, exist_ok=True)
 
+    # init photometric tools
+    stab = PhotometricStabilizer()
+
     try:
         while True:
             ok, frame, ts = r.read()
             if not ok or frame is None:
-                # Non-blocking read: after ~2s of silence, try to reopen ffmpeg
                 stall += 1
                 if stall >= int(max(1.0, 2.0 / max(args.read_timeout, 1e-3))):
                     try:
@@ -298,6 +338,15 @@ def main():
                 frame = cv.resize(frame, frame_size)
 
             H, W = frame.shape[:2]
+
+            # --- PREPROCESS (WB → Photometric → Sky tone)
+            if args.wb_grayworld:
+                frame = _wb_grayworld_safe(frame)
+            if args.photometric:
+                frame = stab(frame)
+            if args.sky_gamma and args.sky_gamma > 0.0:
+                frame = _sky_tone_compress(frame, y_split_frac=args.roi_top_frac, gamma=args.sky_gamma)
+
             gray = as_gray(frame)
 
             # --- base motion mask: weighted fast+slow MOG2
@@ -308,7 +357,7 @@ def main():
                 thr_fast=args.thr_fast, thr_slow=args.thr_slow,
                 use_clahe=args.clahe,
                 size_aware_morph=args.size_aware_morph,
-                learning_rate=args.learning_rate,  # <- use LR from CLI
+                learning_rate=args.learning_rate,
             )
 
             # --- ROI: ignore sky (top portion of the frame)
@@ -317,7 +366,7 @@ def main():
             cv.rectangle(roi, (0, horizon), (W, H), 255, -1)
             mask = cv.bitwise_and(mask, roi)
 
-            # --- slow branch: optical flow (Farnebäck) to catch slow movers (boats)
+            # --- slow branch: optical flow
             slow_mask = np.zeros_like(mask)
             if args.slow_flow:
                 if flow_prev is None:
@@ -325,7 +374,7 @@ def main():
                 else:
                     flow = cv.calcOpticalFlowFarneback(flow_prev, gray, None,
                                                        0.5, 3, 15, 3, 5, 1.2, 0)
-                    mag = cv.magnitude(flow[..., 0], flow[..., 1])  # px/frame
+                    mag = cv.magnitude(flow[..., 0], flow[..., 1])
                     slow_mask = (mag > args.flow_thresh).astype(np.uint8) * 255
                     slow_mask = cv.bitwise_and(slow_mask, roi)
                     slow_mask = cv.morphologyEx(slow_mask, cv.MORPH_OPEN,  k_flow, iterations=1)
@@ -376,7 +425,7 @@ def main():
                     x1, y1, w, h = map(int, (b.x, b.y, b.w, b.h))
                     dets.append(((x1, y1, x1 + w, y1 + h), float(w * h), 0.0))
 
-            # --- final selection: fast OR (slow if overlapping slow_mask)
+            # --- final selection
             selected: List[Tuple[Tuple[int, int, int, int], float, float]] = []
             for (x1, y1, x2, y2), area, speed in dets:
                 pass_speed = speed >= args.min_speed
@@ -390,7 +439,6 @@ def main():
                 if pass_speed or pass_slow:
                     selected.append(((x1, y1, x2, y2), area, speed))
 
-            # --- draw & output
             _draw_boxes(frame, selected)
             if args.save_snaps and selected:
                 ts_ms = int((ts if ts else time.time()) * 1000)
@@ -402,7 +450,6 @@ def main():
                 if cv.waitKey(1) & 0xFF == ord("q"):
                     break
 
-            # --- update history
             last_boxes = [tuple(map(int, (b.x, b.y, b.x + b.w, b.y + b.h))) for b in boxes]
             last_centroids = [((bx1 + bx2) / 2.0, (by1 + by2) / 2.0) for (bx1, by1, bx2, by2) in last_boxes]
             last_ts = ts if ts else time.time()
