@@ -1,0 +1,22 @@
+left: " "
+right: " "
+reader: "ffmpeg_mjpeg"
+width: 1280
+height: 720
+display: true
+print_fps: true
+
+smd:
+  night_auto: false
+  min_area: 8
+  min_area_night_mult: 3.0
+  morph_open_day: 3
+  noise_k_fast: 2.8
+  noise_k_slow: 0.9
+  persist_k: 6
+  persist_m: 4
+  y_area_split: 0.74
+  stereo_patch: 9
+  stereo_search_pad: 24
+  stereo_ncc_min: 0.20
+  min_disp_pair: 0.10

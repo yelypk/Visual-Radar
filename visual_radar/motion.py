@@ -9,9 +9,6 @@ import cv2 as cv
 from visual_radar.utils import BBox
 from visual_radar.io import open_stream  # RTSP reader (opencv | ffmpeg_mjpeg)
 
-# -----------------------------
-# Photometric helpers
-# -----------------------------
 class PhotometricStabilizer:
     def __init__(self, alpha_clip: float = 3.0, momentum: float = 0.02):
         self.m = None
@@ -59,9 +56,6 @@ def _sky_tone_compress(bgr: np.ndarray, y_split_frac: float, gamma: float = 1.25
     top = cv.cvtColor(lab, cv.COLOR_LAB2BGR)
     return np.vstack([top, bot])
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def as_gray(img: np.ndarray) -> np.ndarray:
     """Convert BGR/RGB image to GRAY uint8."""
     if img is None:
@@ -123,17 +117,7 @@ def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter + 1e-6
     return inter / union
 
-
-# -----------------------------
-# Background models
-# -----------------------------
 class DualBGModel:
-    """
-    Two background models:
-      - fast: short memory → detects fast motion (birds, cars)
-      - slow: long memory → keeps slow drift (boats, water)
-    Both implemented with MOG2.
-    """
     def __init__(self, shape_hw: Tuple[int, int]):
         h, w = int(shape_hw[0]), int(shape_hw[1])
         self.fast = cv.createBackgroundSubtractorMOG2(history=50,  varThreshold=16, detectShadows=True)
@@ -219,10 +203,6 @@ def _draw_boxes(frame: np.ndarray, boxes_speeds: List[Tuple[Tuple[int, int, int,
             cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv.LINE_AA
         )
 
-
-# -----------------------------
-# CLI
-# -----------------------------
 def main():
     import argparse
 

@@ -1,671 +1,73 @@
-from __future__ import annotations
+import argparse, sys, os, logging, yaml, time
+from dataclasses import asdict, replace, is_dataclass
+from typing import Any, Mapping
+from .config import AppConfig, SMDParams
+from .pipeline import build_runtime, process_pair, render_and_record
+from .utils import monotonic_s
 
-import time
-import logging
-from pathlib import Path
-from typing import Tuple, Set, Optional, List
+log = logging.getLogger("visual_radar.cli")
 
-import cv2 as cv
-import numpy as np
-
-from visual_radar.config import AppConfig, SMDParams
-from visual_radar.calibration import load_calibration, rectified_pair
-from visual_radar.io import open_stream, make_writer
-from visual_radar.visualize import draw_boxes, stack_lr, imshow_resized, draw_hud
-from visual_radar.snapshots import SnapshotSaver
-from visual_radar.tracks import BoxTracker
-from visual_radar.detector import StereoMotionDetector
-
-
-# --- Photometric & tone tools -------------------------------------------------
-
-class PhotometricStabilizer:
-    def __init__(self, alpha_clip: float = 3.0, momentum: float = 0.02):
-        self.m = None
-        self.s = None
-        self.alpha_clip = float(alpha_clip)
-        self.momentum = float(momentum)
-
-    def _statsL(self, bgr: np.ndarray):
-        lab = cv.cvtColor(bgr, cv.COLOR_BGR2LAB)
-        L = lab[:, :, 0].astype(np.float32)
-        m, s = cv.meanStdDev(L)
-        return float(m), float(s) + 1e-6, lab, L
-
-    def __call__(self, bgr: np.ndarray) -> np.ndarray:
-        m, s, lab, L = self._statsL(bgr)
-        if self.m is None:
-            self.m, self.s = m, s
-        self.m = (1 - self.momentum) * self.m + self.momentum * m
-        self.s = (1 - self.momentum) * self.s + self.momentum * s
-        a = np.clip(self.s / s, 1.0 / self.alpha_clip, self.alpha_clip)
-        b = self.m - a * m
-        Ln = np.clip(a * L + b, 0, 255).astype(np.uint8)
-        lab[:, :, 0] = Ln
-        return cv.cvtColor(lab, cv.COLOR_LAB2BGR)
-
-
-def _wb_grayworld_safe(bgr: np.ndarray) -> np.ndarray:
-    try:
-        wb = cv.xphoto.createGrayworldWB()
-        wb.setSaturationThreshold(0.98)
-        return wb.balanceWhite(bgr)
-    except Exception:
-        return bgr
-
-
-def _sky_tone_compress(bgr: np.ndarray, y_split: float = 0.55, gamma: float = 1.25,
-                       clahe_clip: float = 2.0, clahe_tile: int = 8) -> np.ndarray:
-    H = bgr.shape[0]
-    y = int(H * float(y_split))
-    top = bgr[:y]
-    bot = bgr[y:]
-
-    ycc = cv.cvtColor(top, cv.COLOR_BGR2YCrCb)
-    Y = ycc[:, :, 0].astype(np.float32) / 255.0
-    Y = np.power(Y, float(gamma))
-    ycc[:, :, 0] = np.clip(Y * 255.0, 0, 255).astype(np.uint8)
-    top = cv.cvtColor(ycc, cv.COLOR_YCrCb2BGR)
-
-    lab = cv.cvtColor(top, cv.COLOR_BGR2LAB)
-    lab[:, :, 0] = cv.createCLAHE(clipLimit=float(clahe_clip),
-                                  tileGridSize=(int(clahe_tile), int(clahe_tile))).apply(lab[:, :, 0])
-    top = cv.cvtColor(lab, cv.COLOR_LAB2BGR)
-
-    return np.vstack([top, bot])
-
-
-# --- Sky filters --------------------------------------------------------------
-
-def _lap_var_of_box(gray: np.ndarray, x: int, y: int, w: int, h: int) -> float:
-    H, W = gray.shape[:2]
-    x1 = max(0, int(x)); y1 = max(0, int(y))
-    x2 = min(W, int(x + w)); y2 = min(H, int(y + h))
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return 0.0
-    roi = gray[y1:y2, x1:x2]
-    return float(cv.Laplacian(roi, cv.CV_64F).var())
-
-
-def _filter_sky_boxes(
-    boxes: List,
-    gray: np.ndarray,
-    horizon_y: int,
-    area_min_frac: float,
-    area_max_frac: float,
-    lap_var_min: float,
-) -> List:
-    """Оставляем боксы в небе, удовлетворяющие порогам площади и контрастности."""
-    H, W = gray.shape[:2]
-    A = float(W * H)
-    amin = max(0.0, float(area_min_frac)) * A if area_min_frac > 0 else 0.0
-    amax = max(0.0, float(area_max_frac)) * A if area_max_frac > 0 else 0.0
-
-    kept: List = []
-    for b in boxes:
-        cy = float(b.y + 0.5 * b.h)
-        if cy >= horizon_y:
-            kept.append(b)  # земля/вода — фильтры неба не применяем
-            continue
-        area = float(b.w * b.h)
-        if amin and area < amin:
-            continue
-        if amax and area > amax:
-            continue
-        lv = _lap_var_of_box(gray, int(b.x), int(b.y), int(b.w), int(b.h))
-        if lap_var_min and lv < float(lap_var_min):
-            continue
-        kept.append(b)
-    return kept
-
-
-# --- CLI builder --------------------------------------------------------------
+def _merge_dc(dc, patch: Mapping[str, Any]):
+    if not is_dataclass(dc): return dc
+    d = asdict(dc)
+    for k, v in patch.items():
+        if k not in d: continue
+        if is_dataclass(getattr(dc, k)):
+            setattr(dc, k, _merge_dc(getattr(dc,k), v))
+        else:
+            setattr(dc, k, v)
+    return dc
 
 def build_parser():
-    import argparse
-    parser = argparse.ArgumentParser("visual_radar")
-
-    # Sources
-    parser.add_argument("--left", required=True)
-    parser.add_argument("--right", required=True)
-    parser.add_argument("--reader", default="opencv", choices=["opencv", "ffmpeg_mjpeg"])
-    parser.add_argument("--ffmpeg", default="ffmpeg")
-    parser.add_argument("--mjpeg_q", type=int, default=6)
-    parser.add_argument("--ff_threads", type=int, default=3)
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-
-    # Calibration
-    parser.add_argument("--calib_dir", type=str, default="stereo_rtsp_out")
-    parser.add_argument("--intrinsics", type=str, default=None)
-    parser.add_argument("--baseline", type=float, default=None)
-
-    # Output
-    parser.add_argument("--display", action="store_true")
-    parser.add_argument("--display_max_w", type=int, default=1920)
-    parser.add_argument("--display_max_h", type=int, default=1080)
-    parser.add_argument("--window", choices=["normal", "autosize"], default="normal")
-    parser.add_argument("--save_vis", action="store_true")
-    parser.add_argument("--save_path", type=str, default="out.mp4")
-    parser.add_argument("--save_fps", type=float, default=15.0)
-
-    # Night/Day
-    parser.add_argument("--night_auto", action="store_true")
-    parser.add_argument("--night_luma_thr", type=float, default=50.0)
-    parser.add_argument("--min_area_night_mult", type=float, default=4.0)
-    parser.add_argument("--morph_open_night", type=int, default=7)
-    parser.add_argument("--morph_open_day", type=int, default=3)
-    parser.add_argument("--min_area", type=int, default=25)
-    parser.add_argument("--max_area", type=int, default=0)
-
-    # Noise/Threshold
-    parser.add_argument("--noise_k_fast", type=float, default=2.0)
-    parser.add_argument("--noise_k_slow", type=float, default=1.0)
-
-    # Persistence
-    parser.add_argument("--persist_k", type=int, default=4)
-    parser.add_argument("--persist_m", type=int, default=3)
-
-    # ROI/Crop
-    parser.add_argument("--crop_top", type=int, default=0)
-    parser.add_argument("--roi_mask", type=str, default=None)
-
-    # Drift
-    parser.add_argument("--drift_max_fg_pct", type=float, default=0.25)
-    parser.add_argument("--drift_max_frames", type=int, default=60)
-
-    # Tracker
-    parser.add_argument("--min_track_age", type=int, default=3)
-    parser.add_argument("--max_missed", type=int, default=3)
-    parser.add_argument("--iou_match_thr", type=float, default=0.3)
-    parser.add_argument("--min_track_disp", type=float, default=6.0)
-    parser.add_argument("--min_track_speed", type=float, default=1.2)
-
-    # Stereo/top of frame
-    parser.add_argument("--min_disp_pair", type=float, default=2.5)
-    parser.add_argument("--y_area_split", type=float, default=0.55)
-
-    # Snapshots
-    parser.add_argument("--snapshots", action="store_true")
-    parser.add_argument("--snap_dir", type=str, default="detections")
-    parser.add_argument("--snap_min_cc", type=float, default=0.6)
-    parser.add_argument("--snap_min_disp", type=float, default=1.5)
-    parser.add_argument("--snap_pad", type=int, default=4)
-    parser.add_argument("--snap_cooldown", type=float, default=1.5)
-    parser.add_argument("--snap_debug", action="store_true")
-
-    # Synchronization
-    parser.add_argument("--sync_max_dt", type=float, default=0.05)
-    parser.add_argument("--sync_attempts", type=int, default=4)
-
-    # Stream health
-    parser.add_argument("--cap_buffersize", type=int, default=1)
-    parser.add_argument("--stall_timeout", type=float, default=3.0)
-    parser.add_argument("--max_consec_fail", type=int, default=30)
-
-    # Backend/system
-    parser.add_argument("--cv_threads", type=int, default=0)
-    parser.add_argument("--no_optimized", action="store_true")
-    parser.add_argument("--print_fps", action="store_true")
-
-    # Artifact filter
-    parser.add_argument("--no_drop_artifacts", action="store_true")
-
-    # --- Новые флаги препроцесса/фильтров ------------------------------------
-    parser.add_argument("--wb_grayworld", action="store_true")
-    parser.add_argument("--photometric_stab", action="store_true")
-    parser.add_argument("--sky_gamma", type=float, default=0.0)
-    parser.add_argument("--stereo_only", action="store_true",
-                        help="Оставлять только стерео-подтверждённые детекции (везде)")
-    parser.add_argument("--stereo_only_sky", action="store_true",
-                        help="Стерео-фильтр только в небе; на земле пары не обязательны")
-    parser.add_argument("--sky_max_area_frac", type=float, default=0.0,
-                        help="Макс. площадь бокса в небе (доля кадра); 0 — выкл.")
-    parser.add_argument("--sky_min_area_frac", type=float, default=0.0,
-                        help="Мин. площадь бокса в небе (доля кадра); 0 — выкл.")
-    parser.add_argument("--sky_min_lapl_var", type=float, default=0.0,
-                        help="Мин. дисперсия Лапласиана в небе для пропуска бокса; 0 — выкл.")
-    parser.add_argument("--ground_min_area_frac", type=float, default=0.0,
-                        help="Мин. площадь бокса на земле (доля кадра); 0 — выкл.")
-
-    # --- Новые флаги для стерео-подбора (уловить птиц) -----------------------
-    parser.add_argument("--y_eps", type=float, default=6.0,
-                        help="Допуск по y для эпиполярного гейта (px)")
-    parser.add_argument("--stereo_patch", type=int, default=13,
-                        help="Размер патча NCC (нечётный)")
-    parser.add_argument("--stereo_search_pad", type=int, default=64,
-                        help="Полуполоса поиска по disparity (px)")
-    parser.add_argument("--stereo_ncc_min", type=float, default=0.25,
-                        help="Мин. NCC для принятия пары")
-
-    return parser
-
-
-def args_to_config(args) -> AppConfig:
-    smd = SMDParams(
-        night_auto=bool(args.night_auto),
-        night_luma_thr=float(args.night_luma_thr),
-        min_area=int(args.min_area),
-        max_area=int(args.max_area),
-        min_area_night_mult=float(args.min_area_night_mult),
-        morph_open_day=int(args.morph_open_day),
-        morph_open_night=int(args.morph_open_night),
-        thr_fast=float(args.noise_k_fast),
-        thr_slow=float(args.noise_k_slow),
-        crop_top=int(args.crop_top),
-        roi_mask=args.roi_mask,
-        persist_k=int(args.persist_k),
-        persist_m=int(args.persist_m),
-        drift_max_fg_pct=float(args.drift_max_fg_pct),
-        drift_max_frames=int(args.drift_max_frames),
-        track_iou_thr=float(args.iou_match_thr),
-        track_min_age=int(args.min_track_age),
-        track_max_missed=int(args.max_missed),
-        track_min_disp=float(args.min_track_disp),
-        track_min_speed=float(args.min_track_speed),
-        min_disp_pair=float(args.min_disp_pair),
-        y_area_split=float(args.y_area_split),
-        sails_only=False,
-    )
-    # безопасно пробрасываем стерео-параметры даже если их нет в dataclass
-    for k in ("y_eps", "stereo_patch", "stereo_search_pad", "stereo_ncc_min"):
-        setattr(smd, k, getattr(args, k))
-
-    return AppConfig(
-        left=args.left, right=args.right,
-        calib_dir=args.calib_dir, intrinsics=args.intrinsics, baseline=args.baseline,
-        width=int(args.width), height=int(args.height),
-        display=bool(args.display), save_vis=bool(args.save_vis),
-        smd=smd,
-        reader=args.reader, ffmpeg=args.ffmpeg, mjpeg_q=int(args.mjpeg_q), ff_threads=int(args.ff_threads),
-        display_max_w=int(args.display_max_w), display_max_h=int(args.display_max_h),
-        window=args.window,
-        snapshots=bool(args.snapshots), snap_dir=args.snap_dir,
-        snap_min_cc=float(args.snap_min_cc), snap_min_disp=float(args.snap_min_disp),
-        snap_pad=int(args.snap_pad), snap_cooldown=float(args.snap_cooldown), snap_debug=bool(args.snap_debug),
-        save_path=args.save_path, save_fps=float(args.save_fps),
-        sync_max_dt=float(args.sync_max_dt), sync_attempts=int(args.sync_attempts),
-        cap_buffersize=int(args.cap_buffersize),
-        stall_timeout=float(args.stall_timeout), max_consec_fail=int(args.max_consec_fail),
-        cv_threads=int(args.cv_threads), use_optimized=not bool(args.no_optimized),
-        print_fps=bool(args.print_fps),
-        drop_artifacts=not bool(args.no_drop_artifacts),
-    )
-
-
-# --- FFmpeg helpers -----------------------------------------------------------
-
-def _ff_tail(reader) -> str:
-    try:
-        if hasattr(reader, "last_stderr"):
-            return reader.last_stderr() or ""
-    except Exception as e:
-        return f"<stderr read error: {e!r}>"
-    return ""
-
-def _ff_state(tag: str, reader) -> None:
-    rc = None
-    try:
-        proc = getattr(reader, "proc", None)
-        if proc is not None:
-            rc = proc.poll()
-    except Exception:
-        pass
-    tail = _ff_tail(reader)
-    if rc is not None:
-        logging.warning("[ffmpeg:%s] rc=%s", tag, rc)
-    if tail:
-        logging.warning("[ffmpeg:%s] stderr tail:\n%s", tag, tail)
-
-
-def is_artifact_frame(bgr: np.ndarray) -> bool:
-    if bgr is None or bgr.size == 0:
-        return True
-    gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-    h, w = gray.shape[:2]
-    band = gray[int(h * 0.6):, :]
-    if band.size == 0:
-        return False
-    sigma_all = float(band.std())
-    if sigma_all < 1.0:
-        return True
-    col_std = band.std(axis=0)
-    if float(np.median(col_std)) > (sigma_all * 2.5):
-        return True
-    return False
-
-
-def warmup(reader, timeout_s: float = 20.0) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        ok, frame, ts = reader.read()
-        if ok and frame is not None:
-            return True, frame, ts
-        time.sleep(0.05)
-    return False, None, None
-
-
-def sync_pair(L, R, dt_max: float, attempts: int) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[float]]:
-    okL, frameL, tL = L.read()
-    okR, frameR, tR = R.read()
-    if not okL or not okR:
-        return False, None, None, None, None
-    tries = 0
-    while abs(float(tL) - float(tR)) > dt_max and tries < attempts:
-        if tL < tR:
-            okL, frameL, tL = L.read()
-            if not okL:
-                return False, None, None, None, None
-        else:
-            okR, frameR, tR = R.read()
-            if not okR:
-                return False, None, None, None, None
-        tries += 1
-    if abs(float(tL) - float(tR)) > dt_max:
-        return False, None, None, None, None
-    return True, frameL, frameR, tL, tR
-
-
-def run(cfg: AppConfig) -> None:
-    if cfg.cv_threads and cfg.cv_threads > 0:
-        cv.setNumThreads(int(cfg.cv_threads))
-    cv.setUseOptimized(bool(cfg.use_optimized))
-
-    import sys
-    _argv = " ".join(sys.argv)
-    _use_wb = ("--wb_grayworld" in _argv)
-    _use_stab = ("--photometric_stab" in _argv)
-    _use_stereo_only = ("--stereo_only" in _argv)
-    _use_stereo_only_sky = ("--stereo_only_sky" in _argv)
-
-    def _parse_float(flag: str, default: float = 0.0) -> float:
-        try:
-            if flag in sys.argv:
-                idx = sys.argv.index(flag)
-                return float(sys.argv[idx + 1])
-        except Exception:
-            pass
-        return default
-
-    _sky_gamma = _parse_float("--sky_gamma", 0.0)
-    _sky_max_area_frac = _parse_float("--sky_max_area_frac", 0.0)
-    _sky_min_area_frac = _parse_float("--sky_min_area_frac", 0.0)
-    _sky_min_lapl_var  = _parse_float("--sky_min_lapl_var", 0.0)
-    _ground_min_area_frac = _parse_float("--ground_min_area_frac", 0.0)
-
-    # Readers
-    L = open_stream(cfg.left, cfg.width, cfg.height,
-                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
-                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
-                    cap_buffersize=cfg.cap_buffersize)
-    R = open_stream(cfg.right, cfg.width, cfg.height,
-                    reader=cfg.reader, ffmpeg=cfg.ffmpeg,
-                    mjpeg_q=cfg.mjpeg_q, ff_threads=cfg.ff_threads,
-                    cap_buffersize=cfg.cap_buffersize)
-    logging.info("Reader LEFT : %s.%s", L.__class__.__module__, L.__class__.__name__)
-    logging.info("Reader RIGHT: %s.%s", R.__class__.__module__, R.__class__.__name__)
-
-    okL, frameL0, _ = warmup(L, timeout_s=20.0)
-    okR, frameR0, _ = warmup(R, timeout_s=20.0)
-    if not okL or not okR:
-        _ff_state("L", L)
-        _ff_state("R", R)
-        logging.error("[warmup] No frames within 20s. Stopping.")
-        try:
-            L.release(); R.release()
-        except Exception:
-            pass
-        return
-
-    # sizes
-    h0, w0 = frameL0.shape[:2]
-    cfg.width, cfg.height = w0, h0
-
-    # Window
-    if cfg.display:
-        flag = cv.WINDOW_NORMAL if cfg.window == "normal" else cv.WINDOW_AUTOSIZE
-        cv.namedWindow("VisualRadar L|R", flag)
-
-    # Calibration/remap
-    calib = load_calibration(
-        Path(cfg.calib_dir),
-        Path(cfg.intrinsics) if cfg.intrinsics else None,
-        (cfg.width, cfg.height),
-        cfg.baseline,
-    )
-    frame_size: Tuple[int, int] = (cfg.width, cfg.height)
-
-    detector = StereoMotionDetector(frame_size, cfg.smd)
-
-    trackerL = BoxTracker(
-        iou_thr=float(cfg.smd.track_iou_thr),
-        min_age=int(cfg.smd.track_min_age),
-        max_missed=int(cfg.smd.track_max_missed),
-        min_disp=float(cfg.smd.track_min_disp),
-        min_speed=float(cfg.smd.track_min_speed),
-    )
-    trackerR = BoxTracker(
-        iou_thr=float(cfg.smd.track_iou_thr),
-        min_age=int(cfg.smd.track_min_age),
-        max_missed=int(cfg.smd.track_max_missed),
-        min_disp=float(cfg.smd.track_min_disp),
-        min_speed=float(cfg.smd.track_min_speed),
-    )
-
-    snapshot_saver: Optional[SnapshotSaver] = None
-    if cfg.snapshots:
-        snapshot_saver = SnapshotSaver(
-            out_dir=cfg.snap_dir,
-            min_disp=cfg.snap_min_disp,
-            min_cc=cfg.snap_min_cc,
-            cooldown=cfg.snap_cooldown,
-            pad=cfg.snap_pad,
-            debug=cfg.snap_debug,
-        )
-
-    writer = None
-    save_path = Path(cfg.save_path) if cfg.save_vis else None
-
-    last_ok = time.time()
-    failL = failR = 0
-
-    t_fps = time.perf_counter()
-    fps_cnt = 0
-    loop_fps = 0.0
-
-    stabL = PhotometricStabilizer()
-    stabR = PhotometricStabilizer()
-
-    logging.info("[*] Running. Press ESC to stop.")
-    try:
-        while True:
-            ok, frameL, frameR, tL, tR = sync_pair(L, R, cfg.sync_max_dt, cfg.sync_attempts)
-            if not ok:
-                okl, _, _ = L.read()
-                okr, _, _ = R.read()
-                failL += int(not okl)
-                failR += int(not okr)
-                if failL in (5, 20, 100):
-                    logging.warning("[left] no frames, failL=%d", failL); _ff_state("L", L)
-                if failR in (5, 20, 100):
-                    logging.warning("[right] no frames, failR=%d", failR); _ff_state("R", R)
-                continue
-
-            if cfg.drop_artifacts and (is_artifact_frame(frameL) or is_artifact_frame(frameR)):
-                continue
-
-            failL = failR = 0
-            last_ok = time.time()
-
-            rectL, rectR = rectified_pair(calib, frameL, frameR)
-
-            # PREPROCESS
-            if _use_wb:
-                rectL = _wb_grayworld_safe(rectL); rectR = _wb_grayworld_safe(rectR)
-            if _use_stab:
-                rectL = stabL(rectL); rectR = stabR(rectR)
-            if _sky_gamma > 0.0:
-                rectL = _sky_tone_compress(rectL, y_split=cfg.smd.y_area_split, gamma=_sky_gamma)
-                rectR = _sky_tone_compress(rectR, y_split=cfg.smd.y_area_split, gamma=_sky_gamma)
-
-            # DETECT
-            _, _, boxesL, boxesR, pairs = detector.step(rectL, rectR)
-
-            H, W = rectL.shape[:2]
-            horizon_y = int(cfg.smd.y_area_split * H)
-
-            # --- SKY FILTERS (area range + texture) ---
-            if (_sky_min_area_frac > 0.0) or (_sky_max_area_frac > 0.0) or (_sky_min_lapl_var > 0.0):
-                gL = cv.cvtColor(rectL, cv.COLOR_BGR2GRAY)
-                gR = cv.cvtColor(rectR, cv.COLOR_BGR2GRAY)
-                boxesL = _filter_sky_boxes(boxesL, gL, horizon_y,
-                                           _sky_min_area_frac, _sky_max_area_frac, _sky_min_lapl_var)
-                boxesR = _filter_sky_boxes(boxesR, gR, horizon_y,
-                                           _sky_min_area_frac, _sky_max_area_frac, _sky_min_lapl_var)
-                # чистим пары после фильтра
-                pairs = [(i, j) for (i, j) in pairs
-                         if i < len(boxesL) and j < len(boxesR)]
-
-            # --- Stereo gate (pre-tracking): глобально или только для неба
-            def _is_sky(b):  # центр бокса выше линии горизонта?
-                return (b.y + 0.5 * b.h) < horizon_y
-
-            if _use_stereo_only or _use_stereo_only_sky:
-                keepL_idx: Set[int] = set()
-                keepR_idx: Set[int] = set()
-
-                if _use_stereo_only:
-                    # Жёсткий режим: оставить только боксы, вошедшие в пары (и слева, и справа)
-                    keepL_idx |= {i for (i, j) in pairs}
-                    keepR_idx |= {j for (i, j) in pairs}
-                else:
-                    # Только небо: вверху — пары обязательны; внизу — всё
-                    skyL = {i for i, b in enumerate(boxesL) if _is_sky(b)}
-                    skyR = {j for j, b in enumerate(boxesR) if _is_sky(b)}
-                    keepL_idx |= {i for (i, j) in pairs if i in skyL}
-                    keepR_idx |= {j for (i, j) in pairs if j in skyR}
-                    keepL_idx |= {i for i in range(len(boxesL)) if i not in skyL}
-                    keepR_idx |= {j for j in range(len(boxesR)) if j not in skyR}
-
-                # Фильтр минимального размера для земли
-                if _ground_min_area_frac > 0.0:
-                    A = float(W * H)
-                    amin_g = _ground_min_area_frac * A
-                    keepL_idx = {i for i in keepL_idx
-                                 if (_is_sky(boxesL[i]) or (boxesL[i].w * boxesL[i].h) >= amin_g)}
-                    keepR_idx = {j for j in keepR_idx
-                                 if (_is_sky(boxesR[j]) or (boxesR[j].w * boxesR[j].h) >= amin_g)}
-
-                keepL_sorted = sorted(keepL_idx)
-                keepR_sorted = sorted(keepR_idx)
-                mapL0 = {old: new for new, old in enumerate(keepL_sorted)}
-                mapR0 = {old: new for new, old in enumerate(keepR_sorted)}
-                boxesL = [boxesL[i] for i in keepL_sorted]
-                boxesR = [boxesR[j] for j in keepR_sorted]
-                pairs  = [(mapL0[i], mapR0[j]) for (i, j) in pairs if i in mapL0 and j in mapR0]
-
-            # --- сохраним пред-трекинг
-            preL, preR, pre_pairs = boxesL[:], boxesR[:], pairs[:]
-
-            # TRACK
-            keepL: Set[int] = trackerL.update(preL)
-            keepR: Set[int] = trackerR.update(preR)
-
-            kept_old_L = [i for i in range(len(preL)) if i in keepL]
-            kept_old_R = [j for j in range(len(preR)) if j in keepR]
-            mapL1 = {old: new for new, old in enumerate(kept_old_L)}
-            mapR1 = {old: new for new, old in enumerate(kept_old_R)}
-
-            boxesL = [b for i, b in enumerate(preL) if i in keepL]
-            boxesR = [b for j, b in enumerate(preR) if j in keepR]
-            post_pairs = [(mapL1[i], mapR1[j]) for (i, j) in pre_pairs
-                          if (i in mapL1) and (j in mapR1)]
-
-            # VIZ
-            visL = rectL.copy(); visR = rectR.copy()
-            draw_boxes(visL, boxesL, (0, 255, 0), "L")
-            draw_boxes(visR, boxesR, (255, 0, 0), "R")
-            for (i, j) in post_pairs:
-                if 0 <= i < len(boxesL) and 0 <= j < len(boxesR):
-                    bl, br = boxesL[i], boxesR[j]
-                    cv.circle(visL, (int(bl.cx), int(bl.cy)), 3, (0, 255, 255), -1)
-                    cv.circle(visR, (int(br.cx), int(br.cy)), 3, (0, 255, 255), -1)
-            vis = stack_lr(visL, visR)
-
-            dt_ms = int(abs(float(tL) - float(tR)) * 1000.0)
-            hud_lines = [
-                f"dt: {dt_ms} ms  (thr {int(cfg.sync_max_dt*1000)} ms)",
-                f"night: {detector.is_night}",
-                f"pairs: {len(post_pairs)}",
-                f"fps: {loop_fps:.1f}",
-            ]
-            draw_hud(vis, hud_lines, corner="tr")
-
-            if cfg.save_vis:
-                if writer is None:
-                    h, w = vis.shape[:2]
-                    writer = make_writer(str(save_path), (w, h), fps=cfg.save_fps)
-                writer.write(vis)
-
-            if cfg.display:
-                imshow_resized("VisualRadar L|R", vis, cfg.display_max_w, cfg.display_max_h)
-                if (cv.waitKey(1) & 0xFF) == 27:
-                    break
-
-            # SNAPSHOTS
-            if snapshot_saver is not None and post_pairs:
-                Q = getattr(calib, "Q", None) if hasattr(calib, "Q") else None
-                for (i, j) in post_pairs:
-                    if i >= len(boxesL) or j >= len(boxesR):
-                        continue
-                    bl, br = boxesL[i], boxesR[j]
-                    disp = float(bl.cx - br.cx)
-                    snapshot_saver.maybe_save(
-                        rectL, rectR,
-                        (int(bl.x), int(bl.y), int(bl.w), int(bl.h)),
-                        (int(br.x), int(br.y), int(br.w), int(br.h)),
-                        disp, Q=Q,
-                    )
-
-            # FPS
-            fps_cnt += 1
-            if cfg.print_fps and (time.perf_counter() - t_fps) >= 1.0:
-                loop_fps = float(fps_cnt) / (time.perf_counter() - t_fps)
-                logging.info(f"[loop] {loop_fps:.1f} FPS")
-                fps_cnt = 0
-                t_fps = time.perf_counter()
-
-            # Health: reconnects
-            if (time.time() - last_ok) > cfg.stall_timeout or failL >= cfg.max_consec_fail:
-                logging.warning("[health] Reopen LEFT stream…"); _ff_state("L", L)
-                try: L.reopen()
-                except Exception: pass
-                failL = 0; last_ok = time.time()
-
-            if (time.time() - last_ok) > cfg.stall_timeout or failR >= cfg.max_consec_fail:
-                logging.warning("[health] Reopen RIGHT stream…"); _ff_state("R", R)
-                try: R.reopen()
-                except Exception: pass
-                failR = 0; last_ok = time.time()
-
-    except KeyboardInterrupt:
-        logging.info("[!] Interrupted by user.")
-    finally:
-        try:
-            if writer is not None: writer.release()
-        except Exception: pass
-        try:
-            L.release(); R.release()
-        except Exception: pass
-        if cfg.display: cv.destroyAllWindows()
-
-
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    p = argparse.ArgumentParser("visual-radar")
+    p.add_argument("--config", type=str, help="YAML with AppConfig/SMDParams fields")
+    p.add_argument("--left", type=str); p.add_argument("--right", type=str)
+    p.add_argument("--display", action="store_true"); p.add_argument("--print_fps", action="store_true")
+    p.add_argument("--save_vis", action="store_true"); p.add_argument("--save_path", type=str, default="out.mp4")
+    return p
+
+def args_to_config(args)->AppConfig:
+    cfg = AppConfig()  
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+        cfg = _merge_dc(cfg, doc)
+        if "smd" in doc: cfg.smd = _merge_dc(cfg.smd, doc["smd"])
+    if args.left:  cfg.left  = args.left
+    if args.right: cfg.right = args.right
+    if args.display: cfg.display = True
+    if args.print_fps: cfg.print_fps = True
+    if args.save_vis:  cfg.save_vis  = True
+    if args.save_path: cfg.save_path = args.save_path
+    return cfg
+
+def run(cfg: AppConfig):
+    L, R, calib, detector, tracker, snapper, writer = build_runtime(cfg)
+    last_t = monotonic_s(); fcount = 0
+    while True:
+        okL, frameL, tL = L.read(); okR, frameR, tR = R.read()
+        if not (okL and okR): 
+            if cfg.print_fps: log.warning("read fail; retrying...")
+            continue
+        proc = process_pair(cfg, detector, tracker, calib, frameL, frameR)
+        if snapper is not None:
+            for k in proc.show_idx:
+                iL,iR = proc.pairs[k]
+                disp = proc.boxesL[iL].cx() - proc.boxesR[iR].cx()
+                snapper.maybe_save(proc.rectL, proc.rectR, proc.boxesL[iL], proc.boxesR[iR], disp, getattr(calib, "Q", None))
+        fps_txt = None
+        if cfg.print_fps:
+            fcount += 1
+            now = monotonic_s()
+            if now - last_t >= 1.0:
+                fps_txt = f"FPS:{fcount/(now-last_t):.1f}"
+                last_t = now; fcount = 0
+        render_and_record(cfg, proc, tracker, writer, fps_txt=fps_txt)
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     cfg = args_to_config(args)
     run(cfg)
-
 
 if __name__ == "__main__":
     main()

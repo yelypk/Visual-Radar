@@ -1,4 +1,3 @@
-# visual_radar/io.py
 from __future__ import annotations
 
 from asyncio.log import logger
@@ -20,9 +19,6 @@ from visual_radar.utils import now_s
 
 log = logging.getLogger("visual_radar.io.ffmpeg_mjpeg")
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def _is_rtsp(url: str) -> bool:
     try:
         return url.lower().startswith("rtsp://")
@@ -32,17 +28,8 @@ def _is_rtsp(url: str) -> bool:
 def now_s() -> float:
     return time.time()
 
-# -----------------------------
-# FFmpeg → MJPEG reader (robust for RTSP)
-# -----------------------------
-
 
 class FFmpegRTSP_MJPEG:
-    """
-    RTSP → ffmpeg → MJPEG(stdout) → cv2.imdecode
-    Неблокирующее read(): (ok, frame, ts) или (False, None, None)
-    """
-
     def __init__(
         self,
         url: str,
@@ -53,9 +40,9 @@ class FFmpegRTSP_MJPEG:
         q: int = 6,
         threads: int = 3,
         read_timeout: float = 0.2,
-        stimeout_s: float = 5.0,          # RTSP-сокет таймаут (сек)
-        capture_stderr: bool = True,      # включим по умолчанию для диагностики
-        name: str = "",                   # метка для левого/правого канала в логах
+        stimeout_s: float = 5.0,          
+        capture_stderr: bool = True,      
+        name: str = "",                   
     ):
         self.url = url
         self.w = int(width) if width else 0
@@ -67,8 +54,6 @@ class FFmpegRTSP_MJPEG:
         self.read_timeout = float(read_timeout)
         self.stimeout_us = int(max(0.0, stimeout_s) * 1_000_000)
         self.capture_stderr = capture_stderr
-
-        # логгер экземпляра
         self.log = log.getChild(name or f"{id(self):x}")
 
         self.proc: Optional[subprocess.Popen] = None
@@ -80,7 +65,6 @@ class FFmpegRTSP_MJPEG:
         self._stderr_tail = []
         self._stderr_lock = threading.Lock()
 
-        # статистика для диагностики
         self._frames_ok = 0
         self._frames_dropped_q = 0
         self._frames_bad_jpeg = 0
@@ -95,14 +79,8 @@ class FFmpegRTSP_MJPEG:
         self._start()
 
     def _choose_rtsp_timeout_key(self) -> Optional[str]:
-        """
-        Проверяем, какие опции доступны в этой сборке ffmpeg для протокола rtsp.
-        Возвращаем 'stimeout' или 'rw_timeout' или 'timeout' — либо None.
-        Никаких падений, если что-то не вышло.
-        """
         candidates = ("stimeout", "rw_timeout", "timeout")
         try:
-            # 1) Посмотреть справку протокола RTSP
             out = subprocess.run(
                 [self.ffmpeg_cmd, "-hide_banner", "-loglevel", "quiet", "-h", "protocol=rtsp"],
                 capture_output=True, text=True, timeout=2.0
@@ -113,8 +91,6 @@ class FFmpegRTSP_MJPEG:
                     return key
         except Exception:
             pass
-
-        # 2) fallback: общая справка (на некоторых сборках нет protocol=rtsp)
         try:
             out = subprocess.run(
                 [self.ffmpeg_cmd, "-hide_banner", "-loglevel", "quiet", "-h"],
@@ -126,8 +102,6 @@ class FFmpegRTSP_MJPEG:
                     return key
         except Exception:
             pass
-
-        # 3) Финальный фоллбэк — ничего не добавляем
         return None
 
 
@@ -140,30 +114,19 @@ class FFmpegRTSP_MJPEG:
             self.ffmpeg_cmd,
             "-hide_banner", "-loglevel", "warning", "-nostats", "-nostdin",
             "-rtsp_transport", "tcp" if self.use_tcp else "udp",
-            "-rtsp_flags", "prefer_tcp",                # безопасно даже на старых сборках
+            "-rtsp_flags", "prefer_tcp",               
             "-fflags", "nobuffer",
             "-flags", "low_delay",
             "-use_wallclock_as_timestamps", "1",
-            "-analyzeduration", "1000000",              # 1s
-            "-probesize", "1000000",                    # 1MB
+            "-analyzeduration", "1000000",              
+            "-probesize", "1000000",                    
         ]
 
-        # Добавляем таймаут только если точно поддерживается
         if self._rtsp_timeout_key:
-            # почти везде — микросекунды; вы уже храните self.stimeout_us
             cmd += [f"-{self._rtsp_timeout_key}", str(self.stimeout_us)]
 
-        # вход
         cmd += ["-i", self.url, "-an"]
-
-        # масштабирование (если задано)
         cmd += scale
-
-        # Никаких -vsync: старые сборки выдают warning, а нужды нет
-        # если очень хочется аналог — можно попробовать fps_mode=passthrough,
-        # но на старых сборках его тоже может не быть.
-
-        # Вывод: поток MJPEG в stdout
         cmd += [
             "-f", "mjpeg",
             "-c:v", "mjpeg",
@@ -186,9 +149,7 @@ class FFmpegRTSP_MJPEG:
             self.ffmpeg_cmd,
             "-hide_banner", "-loglevel", "warning", "-nostats", "-nostdin",
             "-rtsp_transport", "tcp" if self.use_tcp else "udp",]
-        # Добавляем таймаут только если точно поддерживается
         if self._rtsp_timeout_key:
-            # почти везде — микросекунды; вы уже храните self.stimeout_us
             cmd += [f"-{self._rtsp_timeout_key}", str(self.stimeout_us)]
 
 
@@ -404,9 +365,6 @@ class FFmpegRTSP_MJPEG:
         self.buf.clear()
         self.log.info("released")
     
-# -----------------------------
-# OpenCV VideoCapture reader (fallback)
-# -----------------------------
 class RTSPReader:
     """
     OpenCV VideoCapture with FFMPEG backend.
@@ -483,9 +441,6 @@ class RTSPReader:
             pass
 
 
-# -----------------------------
-# Writer utility
-# -----------------------------
 def make_writer(
     path: str,
     size: Tuple[int, int],
@@ -544,10 +499,6 @@ def make_writer(
                            f"Try another extension (.mp4/.avi) or install codecs.")
     return writer
 
-
-# -----------------------------
-# Factory
-# -----------------------------
 def open_stream(
     url: str,
     width: int,
@@ -559,13 +510,6 @@ def open_stream(
     cap_buffersize: Optional[int] = None,
     read_timeout: float = 0.2,  # pass to FFmpegRTSP_MJPEG
 ):
-    """
-    Open a video stream using the specified backend.
-
-    reader:
-      - "ffmpeg_mjpeg" → robust decoder via ffmpeg+MJPEG (recommended for RTSP)
-      - "opencv"       → cv.VideoCapture (fallback)
-    """
     if reader == "ffmpeg_mjpeg":
         return FFmpegRTSP_MJPEG(
             url, width, height,

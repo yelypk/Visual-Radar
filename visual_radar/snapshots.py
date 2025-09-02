@@ -1,7 +1,3 @@
-"""
-Snapshot saving utilities for Visual Radar.
-"""
-
 import os
 import time
 from typing import Optional, Tuple
@@ -10,9 +6,6 @@ import cv2 as cv
 import numpy as np
 
 class SnapshotSaver:
-    """
-    Saves snapshots of detected objects from stereo frames.
-    """
     def __init__(
         self,
         out_dir: str,
@@ -42,10 +35,6 @@ class SnapshotSaver:
         disp: float,
         Q: Optional[np.ndarray] = None,
     ) -> Optional[str]:
-        """
-        Save snapshot if conditions are met (cooldown, min_disp, etc.).
-        Returns the saved file path or None.
-        """
         now = time.time()
         if (now - self.last_save_time) < self.cooldown:
             if self.debug:
@@ -56,7 +45,6 @@ class SnapshotSaver:
                 print(f"[SnapshotSaver] Disp {disp:.2f} below min_disp {self.min_disp}.")
             return None
 
-        # Crop and pad boxes
         xL, yL, wL, hL = boxL
         xR, yR, wR, hR = boxR
         pad = self.pad
@@ -68,7 +56,6 @@ class SnapshotSaver:
         fname = f"snap_{timestamp}_{int(disp)}.png"
         path = os.path.join(self.out_dir, fname)
 
-        # Stack crops side by side
         snap = np.hstack([cropL, cropR])
         cv.imwrite(path, snap)
         self.last_save_time = now

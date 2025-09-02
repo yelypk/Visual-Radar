@@ -9,9 +9,6 @@ from visual_radar.utils import BBox
 
 def _iou_xywh(a: Tuple[float, float, float, float],
               b: Tuple[float, float, float, float]) -> float:
-    """
-    Compute Intersection over Union (IoU) for two boxes in (x, y, w, h) format.
-    """
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     ax2, ay2 = ax + aw, ay + ah
@@ -72,12 +69,6 @@ class Trk:
         return float(sum(self.move_hist) / n)
 
 class BoxTracker:
-    """
-    Simple IoU-based tracker with hysteresis.
-    A box is shown if the track is NOT missed on the frame and:
-      age >= min_age AND
-      (total_move >= min_disp OR avg_speed >= min_speed)
-    """
     def __init__(self,
                  iou_thr: float = 0.3,
                  min_age: int = 3,
@@ -93,10 +84,6 @@ class BoxTracker:
         self.next_id: int = 1
 
     def _match(self, det_xywh: List[Tuple[float, float, float, float]]) -> List[Tuple[int, int]]:
-        """
-        Greedy matching by maximum IoU.
-        Returns list of (track_index, detection_index) pairs.
-        """
         M = len(self.tracks)
         N = len(det_xywh)
         if M == 0 or N == 0:
@@ -127,10 +114,6 @@ class BoxTracker:
         return matches
 
     def update(self, boxes: List[BBox]) -> Set[int]:
-        """
-        Update tracker with a list of detections.
-        Returns a set of indices of detections (from input list) that meet display criteria.
-        """
         det_xywh = [(float(b.x), float(b.y), float(b.w), float(b.h)) for b in boxes]
         det_cent = [(float(b.cx), float(b.cy)) for b in boxes]
         N = len(boxes)

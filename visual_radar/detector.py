@@ -16,14 +16,7 @@ from visual_radar.motion import (
 from visual_radar.stereo import gate_pairs_rectified, epipolar_ncc_match
 from visual_radar.utils import BBox
 
-
-# --- helpers ------------------------------------------------------------------
-
-
 def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
-    """
-    Light denoising at night (supports even/odd kernels as per OpenCV docs).
-    """
     if night:
         try:
             gray = cv.fastNlMeansDenoising(gray, None, 7, 7, 21)
@@ -34,9 +27,6 @@ def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
 
 
 def _boxes_from_mask(mask: np.ndarray, min_area: int, max_area: int) -> List[BBox]:
-    """
-    Extract bounding boxes from a binary mask using contours.
-    """
     boxes: List[BBox] = []
     if mask is None or mask.size == 0:
         return boxes
@@ -60,9 +50,6 @@ def _shape_gate_sky(
     max_sky_w: int = 240,
     min_h: int = 3,
 ) -> List[BBox]:
-    """
-    Shape filter for sky region: removes long horizontal cloud stripes.
-    """
     out: List[BBox] = []
     thr_y = split * float(h)
     for b in boxes:
@@ -83,12 +70,6 @@ def _sails_only_gate(
     max_w: int = 240,
     min_h: int = 6,
 ) -> List[BBox]:
-    """
-    Keep only candidate sail boxes:
-    - Centroid below water_y (water region)
-    - Tall box: h/w >= min_h_over_w, h >= min_h, w <= max_w
-    - Brighter than water: mean(gray_box) > median(gray_water_band) + white_delta
-    """
     h, w = gray.shape[:2]
     y1 = max(water_y - 40, 0)
     y2 = min(water_y + 80, h)
@@ -113,16 +94,7 @@ def _sails_only_gate(
             out.append(b)
     return out
 
-
-# --- detector -----------------------------------------------------------------
-
-
 class StereoMotionDetector:
-    """
-    Main detector for a pair of *rectified* frames.
-    Produces (maskL, maskR), (boxesL, boxesR) and stereo pairs.
-    """
-
     def __init__(self, frame_size: Tuple[int, int], params: SMDParams):
         self._frame_size = frame_size  # (w, h)
         self.params = params
@@ -153,7 +125,6 @@ class StereoMotionDetector:
             except Exception:
                 self.roi = None
 
-    # internal: reset background models and persistence
     def _reset_background(self):
         w, h = self._frame_size
         try:
@@ -166,9 +137,7 @@ class StereoMotionDetector:
 
     # main step
     def step(self, rectL_bgr: np.ndarray, rectR_bgr: np.ndarray):
-        """
-        Process a pair of rectified BGR frames and return masks, boxes, and stereo pairs.
-        """
+ 
         gL = as_gray(rectL_bgr)
         gR = as_gray(rectR_bgr)
 
@@ -232,7 +201,6 @@ class StereoMotionDetector:
             mL_fast = cv.morphologyEx(mL_fast, cv.MORPH_OPEN, k3, iterations=1)
             mR_fast = cv.morphologyEx(mR_fast, cv.MORPH_OPEN, k3, iterations=1)
 
-            # Применяем только к верхней части (небо)
             mL[:sky_y, :] = mL_fast[:sky_y, :]
             mR[:sky_y, :] = mR_fast[:sky_y, :]
         except Exception:

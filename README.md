@@ -1,6 +1,6 @@
 # Visual-Radar
 
-The project I am working on. 
+The project I am working on. Just for practice.
 Stereo surveillance on **OpenCV 4.x**. The app reads **two RTSP cameras**, time-syncs frames, rectifies them, detects motion, and **pairs L/R objects** along the epipolar line.
 
 **Results**

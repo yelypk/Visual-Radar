@@ -13,9 +13,6 @@ def draw_boxes(
     tag: str = "",
     thickness: int = 2
 ) -> None:
-    """
-    Draw bounding boxes with optional label.
-    """
     if img is None:
         return
     for b in boxes:
@@ -25,9 +22,6 @@ def draw_boxes(
         cv.putText(img, tag, (8, 22), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv.LINE_AA)
 
 def stack_lr(left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
-    """
-    Horizontally stack two images, aligning heights without distortion.
-    """
     if left_bgr is None or right_bgr is None:
         return left_bgr if right_bgr is None else right_bgr
     hL, wL = left_bgr.shape[:2]
@@ -38,9 +32,6 @@ def stack_lr(left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
     return np.hstack([left_bgr, right_bgr])
 
 def imshow_resized(win: str, img: np.ndarray, max_w: int = 1920, max_h: int = 1080) -> None:
-    """
-    Show image in a window, resizing to fit the screen (WINDOW_NORMAL).
-    """
     if img is None:
         return
     h, w = img.shape[:2]
@@ -57,10 +48,6 @@ def draw_hud(
     corner: str = "tr",
     alpha: float = 0.55
 ) -> None:
-    """
-    Draw a semi-transparent HUD with text.
-    corner: 'tl' | 'tr' | 'bl' | 'br'
-    """
     if img is None or not lines:
         return
     pad, lh, fw = 8, 20, 2

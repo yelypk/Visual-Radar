@@ -3,7 +3,7 @@
 name = "visual-radar"
 version = "0.2.0"
 description = "Modular small-target stereo motion detector with snapshots and MJPEG transcoding"
-authors = [{name="You"}]
+authors = [{name="yelypk}]
 requires-python = ">=3.9"
 dependencies = ["opencv-python>=4.7.0", "numpy>=1.22"]
 

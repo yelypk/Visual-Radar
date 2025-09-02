@@ -1,0 +1,24 @@
+left: ""
+right: " "
+reader: "ffmpeg_mjpeg"
+width: 1280
+height: 720
+display: true
+print_fps: true
+
+smd:
+  night_auto: true
+  night_luma_thr: 55
+  min_area: 18
+  min_area_night_mult: 1.6
+  morph_open_night: 7
+  noise_k_fast: 2.2
+  noise_k_slow: 0.8
+  persist_m: 2
+  crop_top: 340
+  y_area_split: 0.60
+  stereo_only_sky: true
+  sky_min_area_frac: 0.00002
+  ground_min_area_frac: 0.00004
+  min_track_speed: 0.5
+  min_track_disp: 3.0
