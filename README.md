@@ -12,4 +12,4 @@ Stereo surveillance on **OpenCV 4.x**. The app reads **two RTSP cameras**, time-
 
 **Next development steps**
 
-Align the two cameras with each other—i.e., estimate their relative orientation angle in 3D space. The cameras are mounted at the window, so this should be done using distant landmarks as references.
+Align the two cameras with each other-i.e., estimate their relative orientation angle in 3D space. The cameras are mounted at the window, so this should be done using distant landmarks as references.
