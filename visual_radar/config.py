@@ -47,8 +47,8 @@ class SMDParams:
 
 @dataclass
 class AppConfig:
-    left: str = " "    
-    right: str = " "   
+    left: str = ''   
+    right: str = ''   
     reader: str = "ffmpeg_mjpeg"  
 
     width: int = 1280

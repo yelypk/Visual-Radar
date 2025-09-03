@@ -31,6 +31,7 @@ def build_runtime(cfg: AppConfig):
     calib = load_calibration(cfg.calib_dir, cfg.intrinsics, (cfg.width, cfg.height), cfg.baseline)
 
     detector = StereoMotionDetector((cfg.width, cfg.height), cfg.smd)
+    detector.proj_mode = bool(getattr(calib, "proj_mode", False))
     tracker = BoxTracker(cfg.iou_thr, cfg.min_age, cfg.max_missed, cfg.min_disp_pair, cfg.min_speed)
     snapper = SnapshotSaver(cfg.snap_dir, cfg.snap_min_disp, cfg.snap_min_cc,
                             cfg.snap_cooldown, cfg.snap_pad, cfg.snap_debug) if cfg.snapshots else None

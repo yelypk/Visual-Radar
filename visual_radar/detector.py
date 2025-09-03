@@ -16,6 +16,7 @@ from visual_radar.motion import (
 from visual_radar.stereo import gate_pairs_rectified, epipolar_ncc_match
 from visual_radar.utils import BBox
 
+
 def _vr_pre(gray: np.ndarray, night: bool) -> np.ndarray:
     if night:
         try:
@@ -94,7 +95,13 @@ def _sails_only_gate(
             out.append(b)
     return out
 
+
 class StereoMotionDetector:
+    """
+    Основной детектор движения + стерео-спаривание.
+    ВАЖНО: если калибровка в proj_mode (нет валидного Q), стерео отключается.
+    Пайплайн должен проставить detector.proj_mode = calib.proj_mode.
+    """
     def __init__(self, frame_size: Tuple[int, int], params: SMDParams):
         self._frame_size = frame_size  # (w, h)
         self.params = params
@@ -110,6 +117,11 @@ class StereoMotionDetector:
 
         self.is_night: bool = False
         self._drift_streak: int = 0
+
+        self.proj_mode: bool = False
+
+
+        self.stereo_max_boxes: int = int(getattr(self.params, "stereo_max_boxes", 80))
 
         # Optional ROI mask
         self.roi: Optional[np.ndarray] = None
@@ -137,7 +149,6 @@ class StereoMotionDetector:
 
     # main step
     def step(self, rectL_bgr: np.ndarray, rectR_bgr: np.ndarray):
- 
         gL = as_gray(rectL_bgr)
         gR = as_gray(rectR_bgr)
 
@@ -295,6 +306,10 @@ class StereoMotionDetector:
             boxesL = _sails_only_gate(boxesL, gL, water_y, white_delta, min_h_over_w, max_w, min_h)
             boxesR = _sails_only_gate(boxesR, gR, water_y, white_delta, min_h_over_w, max_w, min_h)
 
+        # ---- КРИТИЧЕСКОЕ: если калибровка без валидной Q (proj_mode=True) — пары НЕ считаем
+        if getattr(self, "proj_mode", False):
+            return mL_final, mR_final, boxesL, boxesR, []
+
         # --- pairing and NCC refinement
         pairs = gate_pairs_rectified(
             boxesL, boxesR,
@@ -302,6 +317,11 @@ class StereoMotionDetector:
             float(getattr(self.params, "dmin", -512.0)),
             float(getattr(self.params, "dmax", 512.0)),
         )
+
+        # Защита от «взрыва» NCC на куче боксов
+        max_boxes = max(0, int(getattr(self, "stereo_max_boxes", 80)))
+        if len(boxesL) > max_boxes or len(boxesR) > max_boxes:
+            return mL_final, mR_final, boxesL, boxesR, pairs
 
         matched_R: Set[int] = set(j for _, j in pairs)
         for i, bl in enumerate(boxesL):
