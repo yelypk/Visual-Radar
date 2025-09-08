@@ -1,0 +1,44 @@
+left:  '' 
+right: '' 
+reader: "ffmpeg_mjpeg"        
+
+# --- размеры кадра из RTSP/скейла ---
+width: 2880
+height: 1620
+
+# --- опционально, удобства ---
+display: true
+print_fps: true
+
+# env:
+#   VR_ROT_ONLY: 1
+#   VR_RECTIFY_ALPHA: 0.95   # 0.9–1.0: если ужимает углы — подними к 1.0, если «чернеют» края — опусти до ~0.9
+
+
+# --- калибровка (если у тебя так организовано) ---
+calib_dir: calib
+intrinsics: intrinsics.npz
+#proj_mode: false
+
+# --- Ректификация (вариант B: читабельные ключи) ---
+rectify:
+  alpha: 1.0          # 0..1: 0 — сильный кроп, 1 — полный FOV
+  preserve_k: true    # выравниваем линии, но не «зумим» P1/P2
+  scale: 1.35         # лёгкий дополнительный кроп краёв (попробуй 1.25..1.5)
+
+fisheye:
+  use: false          # true — если перейдёшь на fisheye-калибровку
+  balance: 0.35       # 0..1, кроп/FOV для fisheye
+
+# --- Детектор движения (SMDParams) ---
+smd:
+  min_area: 35
+  min_area_night_mult: 4.0
+  morph_open_day: 3
+  morph_open_night: 7
+  noise_k_fast: 2.6
+  noise_k_slow: 0.8
+  y_area_split: 0.45
+  crop_top: 260
+  persist_k: 5
+  persist_m: 4

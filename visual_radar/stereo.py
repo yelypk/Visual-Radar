@@ -11,6 +11,7 @@ try:
 except Exception:
     _ncc_match = None
 
+
 def gate_pairs_rectified(
     boxesL: List[BBox],
     boxesR: List[BBox],
@@ -48,13 +49,25 @@ def gate_pairs_rectified(
         pairs.append((i, j))
     return pairs
 
+
 def _to_gray(img: np.ndarray) -> np.ndarray:
     return img if img.ndim == 2 else cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
 
 def _grad_img(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
-    gx = cv.Sobel(gray, cv.CV_32F, 1, 0, ksize=ksize)
-    gy = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=ksize)
+    """
+    Безопасный градиент: Sobel поддерживает только ksize ∈ {1,3,5,7}.
+    Любое другое значение приводим к ближайшему допустимому.
+    """
+    k = int(ksize)
+    if   k <= 1: k = 1
+    elif k <= 3: k = 3
+    elif k <= 5: k = 5
+    elif k <= 7: k = 7
+    else:        k = 7
+
+    gx = cv.Sobel(gray, cv.CV_32F, 1, 0, ksize=k)
+    gy = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=k)
     return cv.magnitude(gx, gy)
 
 
@@ -81,6 +94,7 @@ def _parabolic_subpixel_1d(vals: np.ndarray) -> float:
     if abs(denom) < 1e-12:
         return 0.0
     return 0.5 * (l - r) / denom
+
 
 def epipolar_ncc_match(
     grayL: np.ndarray,
@@ -162,6 +176,7 @@ def epipolar_ncc_match(
         float(boxL.h),
     )
 
+
 def _back_match_R_to_L(
     grayL: np.ndarray,
     grayR: np.ndarray,
@@ -174,7 +189,7 @@ def _back_match_R_to_L(
     subpixel: bool,
 ) -> Optional[BBox]:
     return epipolar_ncc_match(
-        grayL=grayR,  
+        grayL=grayR,
         grayR=grayL,
         boxL=boxR,
         search_pad=search_pad,
@@ -184,6 +199,7 @@ def _back_match_R_to_L(
         grad_ksize=grad_ksize,
         subpixel=subpixel,
     )
+
 
 def refine_pairs_lr_consistency(
     boxesL: List[BBox],
@@ -237,7 +253,6 @@ def gate_and_refine_pairs(
     use_gradient: bool = True, grad_ksize: int = 3, subpixel: bool = True,
     max_cx_err_px: float = 2.0,
 ) -> List[Tuple[int, int]]:
- 
     pairs = gate_pairs_rectified(boxesL, boxesR, y_eps, dmin, dmax, w_y, w_d)
     if not enable_lr or not pairs:
         return pairs

@@ -1,24 +1,62 @@
-left: ''
-right: ''
-reader: "ffmpeg_mjpeg"
-width: 1280
-height: 720
-display: true
-print_fps: true
+left: '' 
+right: '' 
+reader: ffmpeg_mjpeg
 
+width: 2880
+height: 1620
+
+calib_dir: calib
+intrinsics: "calib/intrinsics_stereo.npz"
+
+# --- ректификация ---
+rectify:
+  alpha: 1.0
+  preserve_k: true
+  scale: 1.50
+
+# --- детектор (мелкие/дальние цели) ---
 smd:
-  night_auto: true
-  night_luma_thr: 55
-  min_area: 18
-  min_area_night_mult: 1.6
-  morph_open_night: 7
-  noise_k_fast: 2.2
-  noise_k_slow: 0.8
+  min_area: 10
+  min_area_night_mult: 1.3     # итоговый порог ~16px
+  morph_open_night: 3
+  noise_k_fast: 2.0
+  noise_k_slow: 0.6
+  y_area_split: 0.52
+  persist_k: 4
   persist_m: 2
-  crop_top: 340
-  y_area_split: 0.60
-  stereo_only_sky: true
-  sky_min_area_frac: 0.00002
-  ground_min_area_frac: 0.00004
-  min_track_speed: 0.5
-  min_track_disp: 3.0
+  stereo_patch: 9
+  stereo_search_pad: 96
+  stereo_ncc_min: 0.20
+
+# --- целевая зона и фильтры ---
+env:
+  # ВАЖНО: убери/очисти старые VR_KEEP_RECT / VR_IGNORE_RECTS / VR_ROI_POLY,
+  # чтобы они не пересекались с текущим полигоном.
+
+  # ПРАВАЯ камера — полигон дороги (нормированные координаты 0..1).
+  # Этот контур подобран под твой скрин: при необходимости сдвинь точки на ±0.01..0.02.
+  VR_ROI_POLY_R: "0.56,0.64 0.72,0.63 0.88,0.63 0.98,0.66 0.98,0.78 0.55,0.77"
+
+  # Если нужно, можешь добавить похожий полигон и для левой камеры:
+  # VR_ROI_POLY_L: "0.12,0.67 0.36,0.65 0.43,0.70 0.18,0.73"
+
+  # В этой зоне чаще нет L↔R совпадений — работаем моно.
+  VR_FORCE_MONO: 1
+
+  # Антиблик HSV выключен, чтобы не резать фары/задние огни.
+  VR_VETO_SMAX: 0
+  VR_VETO_VMIN: 0
+
+  # Оставляем отсечку «световых столбов».
+  VR_PILLAR_MAX_W: 35
+  VR_PILLAR_AR_MIN: 5.0
+
+  # Подавление «водной ряби»
+  VR_WF_ENABLE: 1
+  VR_WF_COH_MIN: 0.45
+  VR_WF_MAX_TILT_DEG: 22
+  VR_WF_MIN_W: 8
+  VR_WF_MIN_H: 8
+
+print_fps: true
+display: true
